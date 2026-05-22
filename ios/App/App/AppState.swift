@@ -1571,6 +1571,77 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Programme exercise add/delete
+
+    /// Append a new exercise to a session, picked from the library.
+    /// Used by ProgrammePage's "+ Add exercise" button. Defaults match
+    /// what the swap-picker uses for a fresh slot: 3 sets, "8-10" reps,
+    /// 20 kg if not bodyweight, RPE 7-8.
+    func addExercise(
+        weekIdx: Int,
+        sessionIdx: Int,
+        exercise picked: ProgrammeBuilder.LibraryExercise
+    ) async {
+        guard var programme = activeProgramme,
+              var data = programme.data,
+              weekIdx < data.weeks.count else { return }
+        var week = data.weeks[weekIdx]
+        guard sessionIdx < week.sessions.count else { return }
+        var session = week.sessions[sessionIdx]
+
+        let newEx = Exercise(
+            name:    picked.name,
+            tag:     picked.isMain ? "compound" : "accessory",
+            sets:    3,
+            reps:    "8-10",
+            weight:  picked.bodyweight ? nil : 20,
+            rpe:     "7-8",
+            key:     picked.key,
+            bodyweight: picked.bodyweight,
+            muscle:  picked.muscle
+        )
+        session.exercises.append(newEx)
+        week.sessions[sessionIdx] = session
+        data.weeks[weekIdx] = week
+        programme.data = data
+        activeProgramme = programme
+
+        mirrorCurrentSessionAfterEdit(
+            programmeId: programme.id,
+            name: session.name,
+            exercises: session.exercises
+        )
+        await persistProgrammeChange(programme, op: "addExercise")
+    }
+
+    /// Remove an exercise from a session.
+    func deleteExercise(
+        weekIdx: Int,
+        sessionIdx: Int,
+        exerciseIdx: Int
+    ) async {
+        guard var programme = activeProgramme,
+              var data = programme.data,
+              weekIdx < data.weeks.count else { return }
+        var week = data.weeks[weekIdx]
+        guard sessionIdx < week.sessions.count else { return }
+        var session = week.sessions[sessionIdx]
+        guard exerciseIdx < session.exercises.count else { return }
+
+        session.exercises.remove(at: exerciseIdx)
+        week.sessions[sessionIdx] = session
+        data.weeks[weekIdx] = week
+        programme.data = data
+        activeProgramme = programme
+
+        mirrorCurrentSessionAfterEdit(
+            programmeId: programme.id,
+            name: session.name,
+            exercises: session.exercises
+        )
+        await persistProgrammeChange(programme, op: "deleteExercise")
+    }
+
     // MARK: - Programme day management (move / rest / delete / add)
 
     /// Canonical Mon→Sun ordering used when re-sorting sessions after a

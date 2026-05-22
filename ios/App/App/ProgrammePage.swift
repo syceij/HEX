@@ -40,6 +40,18 @@ struct ProgrammePage: View {
         let currentName: String
     }
 
+    /// Identifies the session that just tapped "+ Add exercise" — the
+    /// picker callback appends to this session on selection. Separate
+    /// from SwapContext because add has no source exerciseIdx.
+    private struct AddContext: Identifiable {
+        let id = UUID()
+        let weekIdx: Int
+        let sessionIdx: Int
+    }
+
+    /// Bound to the "+ Add exercise" picker sheet.
+    @State private var addContext: AddContext?
+
     private var ar: Bool { app.language == "ar" }
 
     private var programmeData: ProgrammeData? {
@@ -79,6 +91,24 @@ struct ProgrammePage: View {
                         sessionIdx: ctx.sessionIdx,
                         exerciseIdx: ctx.exerciseIdx,
                         replacement: picked
+                    )
+                }
+            }
+            .environmentObject(app)
+            .presentationDetents([.fraction(0.82), .large])
+            .presentationDragIndicator(.hidden)
+        }
+        // Add-exercise sheet — same picker UI, different callback.
+        // Reusing ExercisePickerSheet lets users pick from the same
+        // library they'd use for a swap, and the picker's "current
+        // name" affordance just becomes irrelevant (empty string).
+        .sheet(item: $addContext) { ctx in
+            ExercisePickerSheet(currentName: "") { picked in
+                Task {
+                    await app.addExercise(
+                        weekIdx: ctx.weekIdx,
+                        sessionIdx: ctx.sessionIdx,
+                        exercise: picked
                     )
                 }
             }
@@ -523,7 +553,61 @@ struct ProgrammePage: View {
                                     weekIdx: weekIdx,
                                     sessionIdx: sessionIdx,
                                     exerciseIdx: exIdx)
+                            // Long-press anywhere on the exercise row
+                            // surfaces a Delete option. Kept out of
+                            // the visible UI so the row stays compact
+                            // and the swap chevron is the discoverable
+                            // affordance for the common case.
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    Task {
+                                        await app.deleteExercise(
+                                            weekIdx: weekIdx,
+                                            sessionIdx: sessionIdx,
+                                            exerciseIdx: exIdx
+                                        )
+                                    }
+                                } label: {
+                                    Label(
+                                        ar ? "حذف التمرين" : "Delete exercise",
+                                        systemImage: "trash"
+                                    )
+                                }
+                            }
                     }
+
+                    // "+ Add exercise" button. Tapping opens the same
+                    // ExercisePickerSheet used for swaps, with no
+                    // current-name pre-fill. The picker's selection
+                    // appends a new exercise to this session via
+                    // AppState.addExercise.
+                    Button {
+                        addContext = AddContext(
+                            weekIdx: weekIdx,
+                            sessionIdx: sessionIdx
+                        )
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.system(size: 15, weight: .semibold))
+                            Text(ar ? "إضافة تمرين" : "Add exercise")
+                                .font(.system(size: 13, weight: .heavy))
+                            Spacer()
+                        }
+                        .foregroundColor(HexTheme.accent)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 11)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(
+                                    HexTheme.accent.opacity(0.4),
+                                    style: StrokeStyle(lineWidth: 1.25, dash: [4, 3])
+                                )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 10)
                 }
                 .padding(.horizontal, 14)
                 .padding(.bottom, 12)
