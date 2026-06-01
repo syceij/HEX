@@ -158,7 +158,8 @@ final class LiveActivityService {
     func syncSetCompletion(
         exerciseName: String,
         setIdx: Int,
-        completed: Bool
+        completed: Bool,
+        restEndsAt: Date? = nil
     ) async {
         guard let activity = currentActivity as? Activity<WorkoutActivityAttributes>
         else { return }
@@ -171,9 +172,13 @@ final class LiveActivityService {
         let was = state.setsCompleted[setIdx]
         state.setsCompleted[setIdx] = completed
         if completed && !was {
-            // Set just completed — start the rest timer, same as a
-            // Lock Screen tap would.
-            state.restEndsAt = Date().addingTimeInterval(Double(state.restSeconds))
+            // Set just completed — start the rest timer. Use the EXACT
+            // end date the in-app timer computed (passed in) so both
+            // countdowns target the same instant and never drift; fall
+            // back to computing it here if the caller didn't supply one
+            // (e.g. a Lock Screen tap, which has no in-app timer).
+            state.restEndsAt = restEndsAt
+                ?? Date().addingTimeInterval(Double(state.restSeconds))
         } else if !completed && was {
             // Un-toggle — cancel the timer for symmetry.
             state.restEndsAt = .distantPast
@@ -212,6 +217,28 @@ final class LiveActivityService {
                 }
             }
         }
+        await activity.update(.init(state: state, staleDate: nil))
+    }
+
+    /// Reflect an in-app weight change in the running Live Activity so
+    /// the Lock Screen card shows the same kg the user just dialled in.
+    /// Called from TrainView's weight stepper. No-op unless the LA is
+    /// currently showing the same exercise the user is editing.
+    @available(iOS 16.2, *)
+    func syncWeight(
+        exerciseName: String,
+        weightKg: Double,
+        bodyweight: Bool
+    ) async {
+        guard let activity = currentActivity as? Activity<WorkoutActivityAttributes>
+        else { return }
+        var state = activity.content.state
+        guard state.exerciseName.lowercased() == exerciseName.lowercased()
+        else { return }
+        state.weightKg = weightKg
+        // Keep the BW label in sync: a >0 weight clears it, a 0/BW
+        // exercise keeps showing "BW".
+        state.weightLabel = (bodyweight || weightKg <= 0) ? "BW" : nil
         await activity.update(.init(state: state, staleDate: nil))
     }
 

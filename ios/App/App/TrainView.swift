@@ -24,6 +24,23 @@ struct TrainView: View {
     @State private var timerPaused: Bool = false
     @State private var liveActivityActive: Bool = false
 
+    /// Absolute instant the rest timer fires. The displayed countdown is
+    /// derived from this against the wall clock — NOT a decrementing
+    /// counter — so locking the phone (which suspends background work)
+    /// can't freeze it, and it stays exactly in lock-step with the Live
+    /// Activity's date-based `Text(restEndsAt, style: .timer)`.
+    @State private var timerEndsAt: Date? = nil
+    /// When paused, the seconds that were left at the moment of pausing.
+    /// `timerEndsAt` is cleared while paused; on resume we set it back to
+    /// `now + pausedRemaining`.
+    @State private var timerPausedRemaining: Int? = nil
+
+    /// 0.5 s heartbeat that recomputes `timerRemaining` from
+    /// `timerEndsAt`. 0.5 (not 1.0) keeps the ring smooth and means the
+    /// digit never visibly lags the Live Activity by more than half a
+    /// second.
+    private let timerTick = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+
     private var ar: Bool { app.language == "ar" }
 
     var body: some View {
@@ -62,10 +79,39 @@ struct TrainView: View {
             if newPhase == .active {
                 app.refreshLiveActivityCompletions()
                 mergeLiveActivityCompletions()
+                // Recompute the countdown immediately on foreground so
+                // the digit is correct the instant the app reappears,
+                // not after the next 0.5s tick.
+                recomputeTimerRemaining()
             }
         }
         .onChange(of: app.liveActivityCompletions) { _ in
             mergeLiveActivityCompletions()
+        }
+        // Date-based countdown heartbeat. Recomputes the displayed
+        // remaining seconds from `timerEndsAt` every 0.5s. Does nothing
+        // when no timer is running or while paused.
+        .onReceive(timerTick) { _ in
+            recomputeTimerRemaining()
+        }
+    }
+
+    /// Derive `timerRemaining` from the absolute `timerEndsAt`. Stops the
+    /// timer (and clears the LA rest state implicitly via the in-app
+    /// stopTimer path) when it reaches zero.
+    private func recomputeTimerRemaining() {
+        guard activeTimerKey != nil else { return }
+        if timerPaused {
+            // Frozen — keep showing the paused remaining value.
+            if let r = timerPausedRemaining { timerRemaining = r }
+            return
+        }
+        guard let ends = timerEndsAt else { return }
+        let remaining = Int(ceil(ends.timeIntervalSinceNow))
+        if remaining <= 0 {
+            stopTimer()
+        } else {
+            timerRemaining = remaining
         }
     }
 
@@ -99,6 +145,8 @@ struct TrainView: View {
         restTimerChoice    = [:]
         timerRemaining     = 0
         timerDuration      = 0
+        timerEndsAt        = nil
+        timerPausedRemaining = nil
         timerPaused        = false
         liveActivityActive = false
         // Drop the Live-Activity-derived completions tied to the previous
@@ -476,7 +524,9 @@ struct TrainView: View {
         let current = editedWeights[exKey] ?? ex.weight ?? 0
         return HStack(spacing: 10) {
             stepperButton(symbol: "minus") {
-                editedWeights[exKey] = max(0, current - 2.5)
+                let next = max(0, current - 2.5)
+                editedWeights[exKey] = next
+                pushWeightToLiveActivity(ex: ex, weight: next)
             }
             VStack(spacing: 0) {
                 Text(current == current.rounded()
@@ -490,7 +540,9 @@ struct TrainView: View {
             }
             .frame(maxWidth: .infinity)
             stepperButton(symbol: "plus") {
-                editedWeights[exKey] = current + 2.5
+                let next = current + 2.5
+                editedWeights[exKey] = next
+                pushWeightToLiveActivity(ex: ex, weight: next)
             }
         }
         .padding(.horizontal, 14)
@@ -503,6 +555,21 @@ struct TrainView: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(HexTheme.border, lineWidth: 1)
         )
+    }
+
+    /// Mirror a weight-stepper change into the running Live Activity so
+    /// the Lock Screen card shows the kg the user just dialled in. No-op
+    /// when no LA is running; the service further no-ops unless the LA
+    /// is currently showing this exact exercise.
+    private func pushWeightToLiveActivity(ex: Exercise, weight: Double) {
+        guard liveActivityActive, #available(iOS 16.2, *) else { return }
+        Task {
+            await LiveActivityService.shared.syncWeight(
+                exerciseName: ex.name,
+                weightKg: weight,
+                bodyweight: ex.bodyweight
+            )
+        }
     }
 
     private func stepperButton(symbol: String, action: @escaping () -> Void) -> some View {
@@ -604,25 +671,15 @@ struct TrainView: View {
         let nowDone = !wasDone
         completedSets[key] = nowDone
 
-        // Push the same flip into the running Live Activity so the
-        // Lock Screen / Dynamic Island card mirrors the in-app state
-        // (it'll only act when the LA is currently showing this
-        // exercise — different exercises stay frozen on the card
-        // until the user explicitly advances).
-        if liveActivityActive, #available(iOS 16.2, *) {
-            Task {
-                await LiveActivityService.shared.syncSetCompletion(
-                    exerciseName: ex.name,
-                    setIdx: setIdx,
-                    completed: nowDone
-                )
-            }
-        }
+        // Decide whether this toggle starts a rest timer, and if so
+        // compute the SINGLE end date both the in-app ring and the
+        // Live Activity will count down to. Sharing the exact instant
+        // is what keeps them in lock-step.
+        var sharedRestEndsAt: Date? = nil
 
         if nowDone {
             // Light haptic confirms the tap registered as "set done".
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            // Set just completed — check if all done
             let allDone = (0..<ex.sets).allSatisfy { completedSets["\(exKey)_\($0)"] == true }
             if allDone {
                 // Stronger haptic when the whole exercise is finished.
@@ -630,11 +687,30 @@ struct TrainView: View {
                 if activeTimerKey == exKey { stopTimer() }
             } else {
                 let dur = restTimerChoice[exKey] ?? 90
-                startTimer(exKey: exKey, duration: dur)
+                // startTimer returns the end date it used — reuse it
+                // verbatim for the LA so the two timers are identical.
+                sharedRestEndsAt = startTimer(exKey: exKey, duration: dur)
             }
         } else {
             // Undo — softer feedback.
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+
+        // Push the same flip into the running Live Activity so the
+        // Lock Screen / Dynamic Island card mirrors the in-app state
+        // (it'll only act when the LA is currently showing this
+        // exercise — different exercises stay frozen on the card
+        // until the user explicitly advances). Pass the shared end
+        // date so the LA timer matches the in-app ring exactly.
+        if liveActivityActive, #available(iOS 16.2, *) {
+            Task {
+                await LiveActivityService.shared.syncSetCompletion(
+                    exerciseName: ex.name,
+                    setIdx: setIdx,
+                    completed: nowDone,
+                    restEndsAt: sharedRestEndsAt
+                )
+            }
         }
     }
 
@@ -644,7 +720,7 @@ struct TrainView: View {
         let total = max(timerDuration, 1)
         let frac  = Double(timerRemaining) / Double(total)
         return Button {
-            timerPaused.toggle()
+            toggleTimerPause()
         } label: {
             ZStack {
                 Circle()
@@ -676,26 +752,54 @@ struct TrainView: View {
         return m > 0 ? "\(m):\(String(format: "%02d", r))" : "\(r)"
     }
 
-    private func startTimer(exKey: String, duration: Int) {
-        activeTimerKey = exKey
-        timerRemaining = duration
-        timerDuration  = duration
-        timerPaused    = false
-        // Drive countdown
-        Task {
-            while activeTimerKey == exKey && timerRemaining > 0 {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if !timerPaused { timerRemaining -= 1 }
-            }
-            if activeTimerKey == exKey { stopTimer() }
-        }
+    /// Start (or restart) the rest timer for `exKey`, counting down to an
+    /// absolute `endsAt`. If the caller already computed an end date
+    /// (so it can hand the SAME instant to the Live Activity), it's
+    /// passed in; otherwise we derive it from `duration`. Date-based so
+    /// backgrounding the app can't freeze it.
+    @discardableResult
+    private func startTimer(exKey: String, duration: Int, endsAt: Date? = nil) -> Date {
+        let end = endsAt ?? Date().addingTimeInterval(Double(duration))
+        activeTimerKey       = exKey
+        timerDuration        = duration
+        timerEndsAt          = end
+        timerPausedRemaining = nil
+        timerPaused          = false
+        timerRemaining       = max(0, Int(ceil(end.timeIntervalSinceNow)))
+        return end
     }
 
     private func stopTimer() {
-        activeTimerKey = nil
-        timerRemaining = 0
-        timerDuration  = 0
-        timerPaused    = false
+        activeTimerKey       = nil
+        timerRemaining       = 0
+        timerDuration        = 0
+        timerEndsAt          = nil
+        timerPausedRemaining = nil
+        timerPaused          = false
+    }
+
+    /// Toggle pause on the rest timer. Pausing freezes the displayed
+    /// remaining value; resuming re-anchors `timerEndsAt` to now + the
+    /// frozen remaining so the countdown continues from where it left
+    /// off. (The Live Activity can't itself pause a date-based timer, so
+    /// pausing is an in-app-only nicety — the LA keeps counting. This is
+    /// a deliberate trade: the common drift cause was backgrounding, now
+    /// fixed; an intentional pause self-heals when the set is logged.)
+    private func toggleTimerPause() {
+        guard activeTimerKey != nil else { return }
+        if timerPaused {
+            // Resume.
+            let remaining = timerPausedRemaining ?? timerRemaining
+            timerEndsAt          = Date().addingTimeInterval(Double(remaining))
+            timerPausedRemaining = nil
+            timerPaused          = false
+        } else {
+            // Pause — capture what's left.
+            if let ends = timerEndsAt {
+                timerPausedRemaining = max(0, Int(ceil(ends.timeIntervalSinceNow)))
+            }
+            timerPaused = true
+        }
     }
 
     // MARK: - Finish button
