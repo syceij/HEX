@@ -304,6 +304,25 @@ struct AccountView: View {
                     : "Your rank at the end of each month",
                 isLast:   true
             )
+
+            // Temporary diagnostic line — shows the live push-registration
+            // trace so we can see on-device where token registration
+            // succeeds or fails. Remove once notifications are confirmed
+            // working in production.
+            Divider().background(HexTheme.border).padding(.leading, 16)
+            HStack(spacing: 8) {
+                Image(systemName: "ladybug.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(HexTheme.mute)
+                Text(app.pushDebugStatus)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(HexTheme.mute)
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
         }
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)

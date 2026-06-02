@@ -69,7 +69,15 @@ final class PushService {
     /// asynchronously call back to AppDelegate's `didRegisterForRemote-
     /// NotificationsWithDeviceToken`, which forwards to handleNewToken.
     private func registerForRemoteNotifications() async {
+        app?.pushDebugStatus = "Asked iOS for APNs token, waiting for Apple…"
         UIApplication.shared.registerForRemoteNotifications()
+    }
+
+    /// Called by AppDelegate when iOS fails to hand back a token. Surfaces
+    /// the reason so we can tell the "callback never fires" case apart
+    /// from an upload failure.
+    func handleRegistrationFailure(_ error: Error) {
+        app?.pushDebugStatus = "Apple refused token: \(error.localizedDescription)"
     }
 
     /// Current notification authorization status — drives the Settings
@@ -140,18 +148,22 @@ final class PushService {
         // Persist locally too so signOut can find it and call
         // deletePushDevice to release this phone's slot.
         UserDefaults.standard.set(tokenHex, forKey: "last_apns_token")
+        app?.pushDebugStatus = "Token received (\(tokenHex.prefix(8))…), uploading…"
         // Only upload once we have a signed-in user. If the token
         // arrives before sign-in (rare — usually after restoreSession),
         // AppState's onSignedIn callback will call this again.
         guard SupabaseManager.shared.currentUser?.id != nil else {
             print("[PushService] token received but no user yet — will replay on sign-in")
+            app?.pushDebugStatus = "Token received but NOT signed in — will retry on next launch"
             return
         }
         do {
             try await SupabaseManager.shared.upsertPushDevice(token: tokenHex)
             print("[PushService] token uploaded to push_devices")
+            app?.pushDebugStatus = "Device registered ✓ (\(tokenHex.prefix(8))…)"
         } catch {
             print("[PushService] token upload failed:", error)
+            app?.pushDebugStatus = "Upload FAILED: \(error.localizedDescription)"
         }
     }
 

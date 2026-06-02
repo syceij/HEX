@@ -44,8 +44,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         didFailToRegisterForRemoteNotificationsWithError error: Error
     ) {
         // Soft failure — most common cause is simulator (no APNs) or
-        // network. Logged for diagnostics; don't bother the user.
+        // network. Logged + surfaced to the Settings debug line so we
+        // can distinguish "Apple never replied" from an upload failure.
         print("[AppDelegate] APNs registration failed:", error)
+        Task { @MainActor in
+            PushService.shared.handleRegistrationFailure(error)
+        }
     }
 
     // ─── Foreground presentation ─────────────────────────────────────────
