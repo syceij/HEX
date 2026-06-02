@@ -139,13 +139,6 @@ final class AppState: ObservableObject {
     /// and ContentView watches it to play the burst animation.
     @Published var confettiTrigger: Int = 0
 
-    /// Human-readable trace of the most recent push-notification
-    /// registration step. Surfaced in Settings → Notifications so we can
-    /// see — on the device, without a Mac console — exactly where token
-    /// registration succeeds or fails. Updated by PushService /
-    /// AppDelegate as the flow progresses.
-    @Published var pushDebugStatus: String = "—"
-
     /// Sets completed via the Live Activity Lock Screen / Dynamic Island
     /// during the current session, keyed by exercise name and storing the
     /// 0-indexed set positions. TrainView merges this into its local
