@@ -142,25 +142,46 @@ struct OTPView: View {
     @ViewBuilder
     private func otpBox(at i: Int) -> some View {
         TextField("", text: Binding(
-            get: { digits[i] },
+            get: { digits.indices.contains(i) ? digits[i] : "" },
             set: { newValue in
+                // Guard the index defensively — digits is always size 6,
+                // but never trust an out-of-range write.
+                guard digits.indices.contains(i) else { return }
                 let filtered = newValue.filter(\.isNumber)
-                if filtered.count >= 6 {
-                    // user pasted full code
+
+                // Multiple digits arriving at once = paste or QuickType
+                // auto-fill. Distribute them across the boxes from the
+                // start. (count == 1 is the normal single keystroke;
+                // count == 0 is a delete.)
+                if filtered.count >= 2 {
+                    var next = Array(repeating: "", count: 6)
                     for (j, ch) in filtered.prefix(6).enumerated() {
-                        digits[j] = String(ch)
+                        next[j] = String(ch)
                     }
-                    focusedIndex = nil
+                    digits = next
+                    errorMsg = nil
+                    let landed = min(filtered.count, 6)
+                    // Defer focus change to the next runloop tick. Mutating
+                    // @FocusState synchronously inside a TextField binding
+                    // setter happens DURING SwiftUI's view update, which
+                    // crashes / hangs on device. Deferring is the standard
+                    // safe pattern.
+                    DispatchQueue.main.async {
+                        focusedIndex = landed >= 6 ? nil : landed
+                    }
                     return
                 }
-                if filtered.count <= 1 {
-                    digits[i] = filtered
-                    if !filtered.isEmpty && i < 5 {
-                        focusedIndex = i + 1
-                    } else if filtered.isEmpty && i > 0 {
-                        focusedIndex = i - 1
-                    }
-                    errorMsg = nil
+
+                // Single digit or deletion.
+                digits[i] = filtered
+                errorMsg = nil
+                let target: Int? = {
+                    if !filtered.isEmpty && i < 5 { return i + 1 }
+                    if filtered.isEmpty && i > 0 { return i - 1 }
+                    return nil
+                }()
+                if let target {
+                    DispatchQueue.main.async { focusedIndex = target }
                 }
             }
         ))
@@ -184,7 +205,8 @@ struct OTPView: View {
 
     private func borderColor(for i: Int) -> Color {
         if focusedIndex == i { return HexTheme.accent }
-        return digits[i].isEmpty ? HexTheme.border : HexTheme.accent
+        let empty = digits.indices.contains(i) ? digits[i].isEmpty : true
+        return empty ? HexTheme.border : HexTheme.accent
     }
 
     private var code: String { digits.joined() }
