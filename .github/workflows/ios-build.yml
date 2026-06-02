@@ -2,6 +2,12 @@ name: iOS Build
 on:
   push:
     branches: [master]
+    # Don't burn a TestFlight build (and a build number) on changes
+    # that can't affect the app — docs site, markdown, SQL migrations.
+    paths-ignore:
+      - 'docs/**'
+      - 'supabase/**'
+      - '**.md'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
