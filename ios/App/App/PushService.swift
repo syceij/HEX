@@ -72,6 +72,51 @@ final class PushService {
         UIApplication.shared.registerForRemoteNotifications()
     }
 
+    /// Current notification authorization status — drives the Settings
+    /// "Enable Notifications" row UI.
+    func authorizationStatus() async -> UNAuthorizationStatus {
+        await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
+    /// Driven by the Settings "Enable Notifications" button. Does the
+    /// right thing for the current status and returns the resulting
+    /// status so the caller can update its UI / deep-link to Settings:
+    ///   • .notDetermined → show the system permission dialog, then
+    ///     register for a token on grant.
+    ///   • .authorized/.provisional → already on; just (re)register so
+    ///     a token lands in push_devices even if the original grant
+    ///     didn't upload one (the bug that left the table empty).
+    ///   • .denied → can't re-prompt; caller should deep-link the user
+    ///     to iOS Settings → HEX → Notifications.
+    @discardableResult
+    func enableNotifications() async -> UNAuthorizationStatus {
+        let centre = UNUserNotificationCenter.current()
+        let status = await centre.notificationSettings().authorizationStatus
+
+        switch status {
+        case .notDetermined:
+            let granted = (try? await centre.requestAuthorization(
+                options: [.alert, .badge, .sound]
+            )) ?? false
+            didRequestPermission = true
+            if granted {
+                await registerForRemoteNotifications()
+                return .authorized
+            }
+            return .denied
+        case .authorized, .provisional, .ephemeral:
+            // Already granted — force a re-register so the token gets
+            // (re)uploaded. This is the recovery path for users whose
+            // permission was granted before token upload worked.
+            await registerForRemoteNotifications()
+            return status
+        case .denied:
+            return .denied
+        @unknown default:
+            return status
+        }
+    }
+
     /// Called from AppState.restoreSession / signIn after the user has
     /// a valid auth session. If the user previously granted permission
     /// on this device, re-register so we re-upload the token (handles

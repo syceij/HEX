@@ -1,6 +1,7 @@
 import SwiftUI
 import PhotosUI
 import Supabase
+import UserNotifications
 
 /// Profile tab — visual port of src/components/ProfileTab.jsx.
 /// Avatar header with name + username + camera button, then Account /
@@ -9,6 +10,7 @@ import Supabase
 /// surfaced via the account view, not a top-level tab).
 struct AccountView: View {
     @EnvironmentObject var app: AppState
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var liveActivitiesEnabled = LiveActivityService.shared.isEnabled
     @State private var showSignOutConfirm    = false
@@ -30,6 +32,11 @@ struct AccountView: View {
     // treated as "ON" by the Edge Function, so the toggles default
     // to the on position for a brand-new user.
     @State private var notifPrefs: [String: Bool] = [:]
+
+    // System notification permission status — drives the "Enable
+    // Notifications" banner. .notDetermined until we check on appear.
+    @State private var notifAuthStatus: UNAuthorizationStatus = .notDetermined
+    @State private var sendingTestPush = false
 
     private var ar: Bool { app.language == "ar" }
 
@@ -85,6 +92,14 @@ struct AccountView: View {
             // which the toggle bindings treat as "all on" (default).
             if let prefs = try? await SupabaseManager.shared.fetchNotificationPrefs() {
                 notifPrefs = prefs
+            }
+            notifAuthStatus = await PushService.shared.authorizationStatus()
+        }
+        // Re-check permission whenever the app foregrounds — the user
+        // may have just toggled it in iOS Settings via the deep-link.
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                Task { notifAuthStatus = await PushService.shared.authorizationStatus() }
             }
         }
         .confirmationDialog(ar ? "تسجيل الخروج؟" : "Sign out?",
@@ -231,6 +246,19 @@ struct AccountView: View {
     /// Missing keys default to "ON" (matches the Edge Function's logic).
     private var notificationsSection: some View {
         VStack(spacing: 0) {
+            // Permission banner — shown unless already authorized. This
+            // is the entry point that actually registers a device token
+            // (the previous build only asked after finishing a session,
+            // which left most users with no token at all).
+            if notifAuthStatus != .authorized {
+                permissionBanner
+                Divider().background(HexTheme.border).padding(.leading, 64)
+            } else {
+                // Authorized — offer a one-tap self-test so the user can
+                // confirm the whole pipe works end to end.
+                testPushRow
+                Divider().background(HexTheme.border).padding(.leading, 64)
+            }
             notificationToggleRow(
                 key:      .friends,
                 icon:     "person.2.fill",
@@ -326,6 +354,96 @@ struct AccountView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 13)
+    }
+
+    /// "Enable Notifications" call-to-action. Tapping requests the
+    /// system permission (if never asked) which registers a device
+    /// token, or — if the user previously denied — deep-links to iOS
+    /// Settings → HEX so they can flip it on. Either way the scenePhase
+    /// .active handler re-checks status when they come back.
+    private var permissionBanner: some View {
+        Button {
+            Task { @MainActor in
+                let result = await PushService.shared.enableNotifications()
+                notifAuthStatus = result
+                if result == .denied {
+                    // Previously denied — can't re-prompt; open Settings.
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        await UIApplication.shared.open(url)
+                    }
+                } else if result == .authorized {
+                    app.toast = ar ? "تم تفعيل الإشعارات ✓" : "Notifications enabled ✓"
+                }
+            }
+        } label: {
+            HStack(spacing: 14) {
+                iconBox(name: "bell.badge.fill", accent: true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ar ? "تفعيل الإشعارات" : "Enable notifications")
+                        .font(.system(size: 14, weight: .heavy))
+                        .foregroundColor(HexTheme.accent)
+                    Text(notifAuthStatus == .denied
+                         ? (ar ? "مرفوضة — اضغط لفتح الإعدادات" : "Denied — tap to open Settings")
+                         : (ar ? "لتصلك طلبات الأصدقاء والتذكيرات" : "For friend requests & reminders"))
+                        .font(.system(size: 11))
+                        .foregroundColor(HexTheme.mute)
+                        .lineLimit(2)
+                }
+                Spacer()
+                Image(systemName: ar ? "chevron.left" : "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(HexTheme.mute)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 13)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Self-test row — shown once notifications are authorized. Fires a
+    /// push to the current user via the send-push Edge Function so they
+    /// can confirm delivery without needing a second account.
+    private var testPushRow: some View {
+        Button {
+            guard let uid = app.currentProfile?.id else { return }
+            sendingTestPush = true
+            Task { @MainActor in
+                await SupabaseManager.shared.sendPush(
+                    toUserIds: [uid],
+                    category:  "friend_request",   // any always-on category
+                    title:     ar ? "HEX يعمل ✓" : "HEX works ✓",
+                    body:      ar
+                        ? "إشعارات HEX مفعّلة بنجاح."
+                        : "Your HEX notifications are working."
+                )
+                sendingTestPush = false
+                app.toast = ar
+                    ? "أُرسل إشعار تجريبي — اقفل الشاشة لرؤيته"
+                    : "Test sent — lock your screen to see it"
+            }
+        } label: {
+            HStack(spacing: 14) {
+                iconBox(name: "paperplane.fill", accent: false)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ar ? "إرسال إشعار تجريبي" : "Send a test notification")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(HexTheme.text)
+                    Text(ar ? "للتأكد أن الإشعارات تصلك" : "Confirm delivery works")
+                        .font(.system(size: 11))
+                        .foregroundColor(HexTheme.mute)
+                }
+                Spacer()
+                if sendingTestPush {
+                    ProgressView().scaleEffect(0.7).tint(HexTheme.mute)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 13)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(sendingTestPush)
     }
 
     // MARK: - Preferences section
