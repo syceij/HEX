@@ -7,38 +7,32 @@ extension SupabaseManager {
 
     // MARK: - Device token registration
 
-    /// Upsert the current device's APNs token into push_devices. Keyed
-    /// by device_token (UNIQUE) so re-installs that produce a new token
-    /// create a new row, while re-launches with the same token are
-    /// no-ops (just bump updated_at).
+    /// Register the current device's APNs token via the
+    /// `register_push_device` RPC. A direct client upsert was being
+    /// rejected by row-level security ("new row violates RLS policy")
+    /// even for authenticated users; the SECURITY DEFINER RPC sets
+    /// user_id = auth.uid() server-side and bypasses the WITH-CHECK
+    /// fragility (same pattern as delete_current_user). Keyed by
+    /// device_token (UNIQUE) so reinstalls upsert cleanly.
     func upsertPushDevice(token: String) async throws {
-        guard let uid = currentUser?.id else { return }
         let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
 
-        struct DeviceRow: Encodable {
-            let user_id: UUID
-            let device_token: String
-            let platform: String
-            let is_sandbox: Bool
-            let app_version: String?
-            let updated_at: String
+        struct Params: Encodable {
+            let p_device_token: String
+            let p_platform: String
+            let p_is_sandbox: Bool
+            let p_app_version: String?
         }
 
-        let row = DeviceRow(
-            user_id:      uid,
-            device_token: token,
-            platform:     "ios",
-            // We ship aps-environment=production via the entitlement, so
-            // tokens are always production-bound. If we ever add Xcode
-            // debug builds, flip this based on a build flag.
-            is_sandbox:   false,
-            app_version:  appVersion,
-            updated_at:   ISO8601DateFormatter().string(from: Date())
-        )
-
         _ = try await client
-            .from("push_devices")
-            .upsert(row, onConflict: "device_token")
+            .rpc("register_push_device", params: Params(
+                p_device_token: token,
+                p_platform:     "ios",
+                // aps-environment=production via the entitlement → tokens
+                // are production-bound. Flip if we ever add Xcode debug.
+                p_is_sandbox:   false,
+                p_app_version:  appVersion
+            ))
             .execute()
     }
 
