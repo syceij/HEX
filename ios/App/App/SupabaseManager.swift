@@ -305,13 +305,19 @@ final class SupabaseManager {
         try? await resetUserData()
 
         // The RPC drops everything including auth.users. Token is
-        // dead after this returns — the signOut below is just for
-        // clearing local state.
+        // dead after this returns.
         _ = try await client
             .rpc("delete_current_user")
             .execute()
 
-        try await signOut()
+        // Clear ONLY the local session. A normal signOut() uses global
+        // scope, which makes a server call to revoke the session — but
+        // the user no longer exists, so that call throws and would
+        // surface as a false "couldn't delete account" error even
+        // though deletion already succeeded. Local scope just wipes the
+        // on-device token, no server round-trip, and `try?` swallows
+        // any residual error since the account is already gone.
+        try? await client.auth.signOut(scope: .local)
     }
 
     // MARK: - Programme helpers
