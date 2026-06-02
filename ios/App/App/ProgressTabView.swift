@@ -846,9 +846,22 @@ struct ProgressTabView: View {
 
     /// Up to 8 weights chronologically (oldest → newest) for the sparkline.
     private func sparklineWeights(for name: String) -> [Double] {
+        // Sort by the precise timestamp (createdAt), falling back to the
+        // day-coarse `date`, ascending = oldest → newest.
+        //
+        // The old code walked `workoutHistory.reversed()` assuming the
+        // array was strictly DESC by time. But fetchHistory orders by
+        // `date` (the calendar DAY, not the timestamp), so two sessions
+        // on the SAME day come back in an undefined order — reversing
+        // could yield newest→oldest and render an INCREASE as a
+        // downward-sloping line (the reported bug: 30→37.5 kg drew a
+        // declining sparkline). Sorting on createdAt here matches what
+        // the detail chart and muscleStats already do.
+        let chronological = app.workoutHistory.sorted { lhs, rhs in
+            (lhs.createdAt ?? lhs.date) < (rhs.createdAt ?? rhs.date)
+        }
         var weights: [Double] = []
-        // workoutHistory is DESC by date — walk reversed to get oldest first.
-        for session in app.workoutHistory.reversed() {
+        for session in chronological {
             if let ex = session.data?.exercises.first(where: {
                 $0.name.lowercased() == name.lowercased()
             }), !ex.bodyweight, let w = ex.weight, w > 0 {
