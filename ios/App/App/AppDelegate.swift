@@ -23,7 +23,20 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // to a NotificationCenter post we publish from didReceive so
         // the SwiftUI layer can react to taps.
         UNUserNotificationCenter.current().delegate = self
+        clearBadge()
         return true
+    }
+
+    // Clear the app-icon badge every time the app comes to the
+    // foreground. Pushes arrive with badge:1, which iOS stamps on the
+    // icon; without this it stays stuck forever because nothing ever
+    // resets the count once the user has seen the notification.
+    func applicationDidBecomeActive(_ application: UIApplication) {
+        clearBadge()
+    }
+
+    private func clearBadge() {
+        UNUserNotificationCenter.current().setBadgeCount(0)
     }
 
     // ─── Token receipt ───────────────────────────────────────────────────
@@ -81,6 +94,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         let category = userInfo["category"] as? String ?? ""
         print("[AppDelegate] notification tap, category=\(category)")
         PushService.shared.handleTap(category: category, payload: userInfo)
+        clearBadge()
         completionHandler()
     }
 }
