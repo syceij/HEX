@@ -23,6 +23,10 @@ struct ProfileView: View {
     /// Drives the "See older months" sheet (foundation for the
     /// future badges/trophies system).
     @State private var showHistory = false
+    /// Monthly history rows for the signed-in user, loaded when the
+    /// history sheet opens.
+    @State private var monthlyHistory: [SupabaseManager.MonthlyResult] = []
+    @State private var loadingHistory = false
 
     /// Drives the Settings (AccountView) sheet. Opens as a modal
     /// rather than a navigation push so it doesn't persist on the
@@ -518,31 +522,115 @@ struct ProfileView: View {
                 .foregroundColor(HexTheme.text)
                 .padding(.top, 6)
 
-            VStack(spacing: 8) {
-                Image(systemName: "trophy.fill")
-                    .font(.system(size: 36))
-                    .foregroundColor(HexTheme.accent.opacity(0.45))
-                Text(ar
-                     ? "السجل سيظهر هنا في نهاية كل شهر"
-                     : "Past months appear here as you complete them")
-                    .font(HexTheme.font(size: 14, weight: .heavy, ar: ar))
-                    .foregroundColor(HexTheme.dim)
-                    .multilineTextAlignment(.center)
-                Text(ar
-                     ? "هذه الأساسات الجديدة لنظام الأوسمة القادم"
-                     : "Foundation for the upcoming badges & trophies system")
-                    .font(HexTheme.font(size: 12, weight: .regular, ar: ar))
-                    .foregroundColor(HexTheme.mute)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 32)
+            // Merge the stored history with the live current-month score
+            // (from leaderboard_data) so the current month always shows
+            // even before its first snapshot lands.
+            let rows = mergedHistoryRows()
+
+            if rows.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "trophy.fill")
+                        .font(.system(size: 36))
+                        .foregroundColor(HexTheme.accent.opacity(0.45))
+                    Text(ar
+                         ? "ابدأ التدريب وسيظهر سجلك الشهري هنا"
+                         : "Train this month and your history starts here")
+                        .font(HexTheme.font(size: 14, weight: .heavy, ar: ar))
+                        .foregroundColor(HexTheme.dim)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                }
+                .padding(.top, 28)
+            } else {
+                ScrollView {
+                    VStack(spacing: 10) {
+                        ForEach(rows) { row in
+                            monthlyRow(row)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+                }
             }
-            .padding(.top, 28)
-            Spacer()
+            Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(HexTheme.bg.ignoresSafeArea())
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.hidden)
+        .task {
+            loadingHistory = true
+            if let uid = app.currentProfile?.id
+                ?? SupabaseManager.shared.currentUser?.id {
+                monthlyHistory = (try? await SupabaseManager.shared
+                    .fetchLeaderboardHistory(userId: uid)) ?? []
+            }
+            loadingHistory = false
+        }
+    }
+
+    /// Combine stored history rows with the live current-month score so
+    /// the timeline shows the current month immediately (its snapshot may
+    /// not have been written yet). De-dupes on month, current data wins.
+    private func mergedHistoryRows() -> [SupabaseManager.MonthlyResult] {
+        var byMonth: [String: SupabaseManager.MonthlyResult] = [:]
+        for r in monthlyHistory { byMonth[r.month] = r }
+        if let ld = app.currentProfileLeaderboard {
+            byMonth[ld.month] = .init(
+                month:          ld.month,
+                score:          ld.score,
+                setsCompleted:  ld.setsCompleted,
+                setsProgrammed: ld.setsProgrammed,
+                improvementPct: ld.improvementPct
+            )
+        }
+        return byMonth.values.sorted { $0.month > $1.month }
+    }
+
+    /// A single month card: localized month name + score + consistency.
+    @ViewBuilder
+    private func monthlyRow(_ r: SupabaseManager.MonthlyResult) -> some View {
+        HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(Self.formattedMonthYear(for: monthDate(r.month), ar: ar))
+                    .font(HexTheme.font(size: 14, weight: .heavy, ar: ar))
+                    .foregroundColor(HexTheme.text)
+                Text(ar
+                     ? "\(r.setsCompleted)/\(r.setsProgrammed) مجموعة · +\(r.improvementPct)٪"
+                     : "\(r.setsCompleted)/\(r.setsProgrammed) sets · +\(r.improvementPct)%")
+                    .font(HexTheme.font(size: 11, weight: .regular, ar: ar))
+                    .foregroundColor(HexTheme.mute)
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 0) {
+                Text("\(r.score)")
+                    .font(.system(size: 22, weight: .heavy))
+                    .foregroundColor(HexTheme.accent)
+                Text(ar ? "نقطة" : "pts")
+                    .font(HexTheme.font(size: 10, weight: .regular, ar: ar))
+                    .foregroundColor(HexTheme.mute)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(HexTheme.surface2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(HexTheme.border, lineWidth: 1)
+        )
+    }
+
+    /// Parse "YYYY-MM" → a Date on the 1st of that month (Gregorian).
+    private func monthDate(_ key: String) -> Date {
+        let parts = key.split(separator: "-")
+        var c = DateComponents()
+        c.year = parts.count > 0 ? Int(parts[0]) : nil
+        c.month = parts.count > 1 ? Int(parts[1]) : nil
+        c.day = 1
+        return Calendar(identifier: .gregorian).date(from: c) ?? Date()
     }
 
     // MARK: - Helpers

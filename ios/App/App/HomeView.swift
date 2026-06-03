@@ -495,8 +495,6 @@ struct HomeView: View {
                      label: ar ? "جلسات"    : "SESSIONS")
             statCard(value: "\(streakCount) 🔥",
                      label: ar ? "الإنجاز"   : "STREAK")
-            statCard(value: lastVolumeLabel,
-                     label: ar ? "آخر حجم"   : "LAST VOL.")
         }
     }
 
@@ -655,30 +653,6 @@ struct HomeView: View {
             cursor = prev
         }
         return streak
-    }
-
-    /// Volume of the most recent session — sum of `weight × sets` across
-    /// exercises that have a real working weight. Displays "—" if not
-    /// computable. Formats >=1000 kg as e.g. "12t".
-    private var lastVolumeLabel: String {
-        guard let last = app.workoutHistory.first,
-              let exercises = last.data?.exercises
-        else { return "—" }
-        // Match React's history-volume reducer in App.jsx:
-        //   r.data.exercises.reduce((s, ex) =>
-        //     (!ex.bodyweight && ex.weight) ? s + ex.weight * (ex.sets || 1) : s, 0)
-        let vol = exercises.reduce(0.0) { acc, ex in
-            if ex.bodyweight { return acc }
-            let w = ex.weight ?? 0
-            guard w > 0 else { return acc }
-            let setCount = max(ex.sets, 1)
-            return acc + w * Double(setCount)
-        }
-        guard vol > 0 else { return "—" }
-        if vol >= 1000 {
-            return "\(Int(vol / 1000))t"
-        }
-        return "\(Int(vol))kg"
     }
 
     private func statCard(value: String, label: String) -> some View {

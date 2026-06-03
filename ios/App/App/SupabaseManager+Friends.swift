@@ -478,10 +478,82 @@ extension SupabaseManager {
                 .update(UpdatePayload(leaderboard_data: encoded))
                 .eq("id", value: uid)
                 .execute()
+
+            // Also snapshot this month into leaderboard_history so the
+            // Monthly History timeline accumulates. Best-effort — a
+            // failed snapshot must never block the score update.
+            await snapshotMonthlyScore(data)
+
             return data
         } catch {
             print("[updateLeaderboardScore] failed:", error)
             return nil
+        }
+    }
+
+    // MARK: - Monthly history
+
+    /// One month's snapshot, read from leaderboard_history. Used by the
+    /// Profile "Monthly History" sheet + friend profiles.
+    struct MonthlyResult: Identifiable, Hashable {
+        var month: String          // "YYYY-MM"
+        var score: Int
+        var setsCompleted: Int
+        var setsProgrammed: Int
+        var improvementPct: Int
+        var id: String { month }
+    }
+
+    /// Upsert the current month into leaderboard_history via the
+    /// SECURITY DEFINER RPC. Best-effort; errors are logged only.
+    func snapshotMonthlyScore(_ data: LeaderboardData) async {
+        struct Params: Encodable {
+            let p_month: String
+            let p_score: Int
+            let p_sets_completed: Int
+            let p_sets_programmed: Int
+            let p_improvement_pct: Int
+        }
+        do {
+            _ = try await client
+                .rpc("snapshot_leaderboard_month", params: Params(
+                    p_month:           data.month,
+                    p_score:           data.score,
+                    p_sets_completed:  data.setsCompleted,
+                    p_sets_programmed: data.setsProgrammed,
+                    p_improvement_pct: data.improvementPct
+                ))
+                .execute()
+        } catch {
+            print("[snapshotMonthlyScore] failed (non-fatal):", error)
+        }
+    }
+
+    /// Fetch a user's monthly history, newest month first. Works for the
+    /// current user OR any friend (read policy is open to authenticated).
+    func fetchLeaderboardHistory(userId: UUID) async throws -> [MonthlyResult] {
+        struct Row: Decodable {
+            let month: String
+            let score: Int
+            let sets_completed: Int
+            let sets_programmed: Int
+            let improvement_pct: Int
+        }
+        let rows: [Row] = try await client
+            .from("leaderboard_history")
+            .select("month, score, sets_completed, sets_programmed, improvement_pct")
+            .eq("user_id", value: userId)
+            .order("month", ascending: false)
+            .execute()
+            .value
+        return rows.map {
+            MonthlyResult(
+                month:          $0.month,
+                score:          $0.score,
+                setsCompleted:  $0.sets_completed,
+                setsProgrammed: $0.sets_programmed,
+                improvementPct: $0.improvement_pct
+            )
         }
     }
 

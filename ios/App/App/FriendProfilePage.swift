@@ -14,6 +14,7 @@ struct FriendProfilePage: View {
     @State private var profile: SupabaseManager.FriendProfileRow?
     @State private var sessions: [FriendSession] = []
     @State private var weights: [String: Double] = [:]
+    @State private var monthlyHistory: [SupabaseManager.MonthlyResult] = []
     @State private var loading = true
 
     @State private var confirmingRemove = false
@@ -184,6 +185,10 @@ struct FriendProfilePage: View {
 
                     if canSeeSessions, !sessions.isEmpty {
                         recentSessionsCard
+                    }
+
+                    if !monthlyHistory.isEmpty {
+                        monthlyHistoryCard
                     }
 
                     if canSeeWeights, !weights.isEmpty {
@@ -510,6 +515,69 @@ struct FriendProfilePage: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(HexTheme.border, lineWidth: 1)
         )
+    }
+
+    /// Friend's month-by-month score timeline (newest first), read from
+    /// leaderboard_history. Hidden when the friend has no history yet.
+    private var monthlyHistoryCard: some View {
+        VStack(spacing: 0) {
+            Text(ar ? "السجل الشهري" : "MONTHLY HISTORY")
+                .font(.system(size: 12, weight: .heavy))
+                .kerning(ar ? 0 : 0.7)
+                .foregroundColor(HexTheme.dim)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+
+            ForEach(monthlyHistory.prefix(12)) { r in
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(monthLabel(r.month))
+                            .font(.system(size: 13, weight: .heavy))
+                            .foregroundColor(HexTheme.text)
+                        Text(ar
+                             ? "\(r.setsCompleted)/\(r.setsProgrammed) مجموعة · +\(r.improvementPct)٪"
+                             : "\(r.setsCompleted)/\(r.setsProgrammed) sets · +\(r.improvementPct)%")
+                            .font(.system(size: 11))
+                            .foregroundColor(HexTheme.mute)
+                    }
+                    Spacer()
+                    Text(ar ? "\(r.score) نقطة" : "\(r.score) pts")
+                        .font(.system(size: 14, weight: .heavy))
+                        .foregroundColor(HexTheme.accent)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 11)
+                .overlay(
+                    Rectangle().fill(HexTheme.border).frame(height: 1),
+                    alignment: .top
+                )
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(HexTheme.surface2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(HexTheme.border, lineWidth: 1)
+        )
+    }
+
+    /// "YYYY-MM" → localized "Month YYYY", Gregorian-pinned.
+    private func monthLabel(_ key: String) -> String {
+        let parts = key.split(separator: "-")
+        var c = DateComponents()
+        c.year = parts.count > 0 ? Int(parts[0]) : nil
+        c.month = parts.count > 1 ? Int(parts[1]) : nil
+        c.day = 1
+        let date = Calendar(identifier: .gregorian).date(from: c) ?? Date()
+        let df = DateFormatter()
+        df.locale = Locale(identifier: ar ? "ar" : "en")
+        df.calendar = Calendar(identifier: .gregorian)
+        df.dateFormat = "MMMM yyyy"
+        return df.string(from: date)
     }
 
     private var workingWeightsCard: some View {
@@ -870,6 +938,9 @@ struct FriendProfilePage: View {
             print("[FriendProfilePage] load failed:", error)
         }
         self.friendProgramme = await prog
+        // Friend's monthly history — best-effort, hidden if empty.
+        self.monthlyHistory = (try? await SupabaseManager.shared
+            .fetchLeaderboardHistory(userId: friend.id)) ?? []
         loading = false
     }
 
