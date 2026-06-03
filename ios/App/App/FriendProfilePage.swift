@@ -187,7 +187,7 @@ struct FriendProfilePage: View {
                         recentSessionsCard
                     }
 
-                    if !monthlyHistory.isEmpty {
+                    if !pastMonths.isEmpty {
                         monthlyHistoryCard
                     }
 
@@ -517,8 +517,16 @@ struct FriendProfilePage: View {
         )
     }
 
-    /// Friend's month-by-month score timeline (newest first), read from
-    /// leaderboard_history. Hidden when the friend has no history yet.
+    /// Friend's COMPLETED past months (current month excluded — its
+    /// score isn't final yet). Newest first.
+    private var pastMonths: [SupabaseManager.MonthlyResult] {
+        let c = Calendar(identifier: .gregorian).dateComponents([.year, .month], from: Date())
+        let current = String(format: "%04d-%02d", c.year ?? 0, c.month ?? 0)
+        return monthlyHistory.filter { $0.month < current }.sorted { $0.month > $1.month }
+    }
+
+    /// Friend's month-by-month score timeline (past months, newest
+    /// first), read from leaderboard_history. Hidden when empty.
     private var monthlyHistoryCard: some View {
         VStack(spacing: 0) {
             Text(ar ? "السجل الشهري" : "MONTHLY HISTORY")
@@ -530,7 +538,7 @@ struct FriendProfilePage: View {
                 .padding(.top, 12)
                 .padding(.bottom, 8)
 
-            ForEach(monthlyHistory.prefix(12)) { r in
+            ForEach(pastMonths.prefix(12)) { r in
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(monthLabel(r.month))

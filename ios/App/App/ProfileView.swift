@@ -522,10 +522,13 @@ struct ProfileView: View {
                 .foregroundColor(HexTheme.text)
                 .padding(.top, 6)
 
-            // Merge the stored history with the live current-month score
-            // (from leaderboard_data) so the current month always shows
-            // even before its first snapshot lands.
-            let rows = mergedHistoryRows()
+            // PAST months only. The current month is intentionally
+            // excluded — its score is still climbing and is already
+            // shown in the big "this month" card. A month's "final
+            // score" is its value on the last day before it resets,
+            // which is exactly what its frozen row holds once the
+            // month rolls over.
+            let rows = pastMonthRows()
 
             if rows.isEmpty {
                 VStack(spacing: 8) {
@@ -533,8 +536,8 @@ struct ProfileView: View {
                         .font(.system(size: 36))
                         .foregroundColor(HexTheme.accent.opacity(0.45))
                     Text(ar
-                         ? "ابدأ التدريب وسيظهر سجلك الشهري هنا"
-                         : "Train this month and your history starts here")
+                         ? "سجل أشهرك المكتملة سيظهر هنا في نهاية كل شهر"
+                         : "Your completed months will appear here at the end of each month")
                         .font(HexTheme.font(size: 14, weight: .heavy, ar: ar))
                         .foregroundColor(HexTheme.dim)
                         .multilineTextAlignment(.center)
@@ -569,22 +572,21 @@ struct ProfileView: View {
         }
     }
 
-    /// Combine stored history rows with the live current-month score so
-    /// the timeline shows the current month immediately (its snapshot may
-    /// not have been written yet). De-dupes on month, current data wins.
-    private func mergedHistoryRows() -> [SupabaseManager.MonthlyResult] {
-        var byMonth: [String: SupabaseManager.MonthlyResult] = [:]
-        for r in monthlyHistory { byMonth[r.month] = r }
-        if let ld = app.currentProfileLeaderboard {
-            byMonth[ld.month] = .init(
-                month:          ld.month,
-                score:          ld.score,
-                setsCompleted:  ld.setsCompleted,
-                setsProgrammed: ld.setsProgrammed,
-                improvementPct: ld.improvementPct
-            )
-        }
-        return byMonth.values.sorted { $0.month > $1.month }
+    /// Stored history rows for months STRICTLY BEFORE the current one,
+    /// newest first. The current month is excluded — its score isn't
+    /// final until the month ends (it's shown live in the top card).
+    private func pastMonthRows() -> [SupabaseManager.MonthlyResult] {
+        let current = ProfileView.currentMonthKey()
+        return monthlyHistory
+            .filter { $0.month < current }
+            .sorted { $0.month > $1.month }
+    }
+
+    /// Current month as "YYYY-MM" (Gregorian) — the dividing line
+    /// between "live" and "history".
+    static func currentMonthKey() -> String {
+        let c = Calendar(identifier: .gregorian).dateComponents([.year, .month], from: Date())
+        return String(format: "%04d-%02d", c.year ?? 0, c.month ?? 0)
     }
 
     /// A single month card: localized month name + score + consistency.
