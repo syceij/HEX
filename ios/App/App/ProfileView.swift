@@ -575,18 +575,12 @@ struct ProfileView: View {
     /// Stored history rows for months STRICTLY BEFORE the current one,
     /// newest first. The current month is excluded — its score isn't
     /// final until the month ends (it's shown live in the top card).
+    /// Reuses the existing Self.currentMonthKey() helper.
     private func pastMonthRows() -> [SupabaseManager.MonthlyResult] {
-        let current = ProfileView.currentMonthKey()
+        let current = Self.currentMonthKey()
         return monthlyHistory
             .filter { $0.month < current }
             .sorted { $0.month > $1.month }
-    }
-
-    /// Current month as "YYYY-MM" (Gregorian) — the dividing line
-    /// between "live" and "history".
-    static func currentMonthKey() -> String {
-        let c = Calendar(identifier: .gregorian).dateComponents([.year, .month], from: Date())
-        return String(format: "%04d-%02d", c.year ?? 0, c.month ?? 0)
     }
 
     /// A single month card: localized month name + score + consistency.
