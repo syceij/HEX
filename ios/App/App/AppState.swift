@@ -1293,6 +1293,13 @@ final class AppState: ObservableObject {
                 "exercises":    session.data?.exercises.count ?? 0,
             ]
         )
+        // Refresh the local feed immediately so the user sees their own
+        // just-completed session right away. Previously this only
+        // happened when the Realtime INSERT event fired (~1.5s debounce),
+        // so on a flaky connection the user's own session could be
+        // missing from Recent Activity until they left and re-entered
+        // the tab. This explicit refresh makes it appear deterministically.
+        await refreshActivityFeed()
 
         // Ask for push permission now if we haven't yet. This is the
         // best moment in the app — the user just finished their first
