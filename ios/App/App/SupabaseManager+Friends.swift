@@ -236,23 +236,56 @@ extension SupabaseManager {
 
     // MARK: - Activity feed
 
-    /// Fire-and-forget activity insert. Errors are swallowed (never throw).
-    func insertActivity(type: String, data: [String: Any]) async {
-        guard let uid = currentUser?.id else { return }
+    /// Best-effort activity insert with idempotent retry.
+    ///
+    /// Was previously a single fire-and-forget insert whose failure was
+    /// swallowed — so a transient network blip in the ~2s after a session
+    /// save could silently drop the feed row while the workout itself
+    /// saved fine. One such drop was seen in production (a `sessions` row
+    /// with no matching `activity_feed` row), which made that session
+    /// invisible in every friend's Recent Activity.
+    ///
+    /// Hardening:
+    ///   • The row `id` is generated ONCE on the client, then we retry up
+    ///     to 3× with backoff. Each attempt is an UPSERT keyed on `id`, so
+    ///     if an earlier attempt actually committed server-side but the
+    ///     client never saw the ack (timeout), the retry rewrites the same
+    ///     row rather than creating a duplicate.
+    ///   • Still never throws: the social-feed echo must never block or
+    ///     fail a workout save.
+    ///   • The happy path adds ZERO delay — attempt 1 has no backoff and
+    ///     returns immediately on success; the sleeps only run after a
+    ///     failed attempt.
+    ///
+    /// Returns true once the row is known to be persisted, false if every
+    /// attempt failed (caller should not treat that as a save failure).
+    @discardableResult
+    func insertActivity(type: String, data: [String: Any]) async -> Bool {
+        guard let uid = currentUser?.id else { return false }
         let encoded = data.mapValues { AnyCodable($0) }
         struct Payload: Encodable {
+            let id: UUID
             let user_id: UUID
             let type: String
             let data: [String: AnyCodable]
         }
-        do {
-            _ = try await client
-                .from("activity_feed")
-                .insert(Payload(user_id: uid, type: type, data: encoded))
-                .execute()
-        } catch {
-            print("[insertActivity] failed (non-fatal):", error)
+        let payload = Payload(id: UUID(), user_id: uid, type: type, data: encoded)
+        // Backoff before each attempt, in nanoseconds: 0s, 0.8s, 2.0s.
+        let backoffs: [UInt64] = [0, 800_000_000, 2_000_000_000]
+        for (attempt, delay) in backoffs.enumerated() {
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            do {
+                _ = try await client
+                    .from("activity_feed")
+                    .upsert(payload, onConflict: "id")
+                    .execute()
+                return true
+            } catch {
+                print("[insertActivity] attempt \(attempt + 1)/\(backoffs.count) failed:", error)
+            }
         }
+        print("[insertActivity] all attempts failed (non-fatal) — feed row not written")
+        return false
     }
 
     /// Load recent activity for the user + their friends. Limit 20 newest.
