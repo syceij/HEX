@@ -36,11 +36,15 @@ struct TrainView: View {
     /// Slot the lifted card would land in if released now — drives the
     /// make-room offsets of every other card.
     @State private var dragProposedIndex: Int? = nil
-    /// Live card frames (in the scroll view's space) from the layout
-    /// preference — refreshed continuously while idle.
-    @State private var cardFrames: [Int: CGRect] = [:]
-    /// Frozen copy of `cardFrames` taken at lift time. All mid-drag math
-    /// uses this snapshot, because the live frames move with the
+    /// Live card frames (in the scroll view's space). Held in a plain
+    /// class — NOT @State — on purpose: the frames change on every
+    /// scrolled frame, and pushing that through @State re-rendered the
+    /// whole Train tab at scroll framerate (the "laggy, sticky scroll"
+    /// bug). Mutating a class property doesn't invalidate any view; the
+    /// drag only reads the values once, at lift time.
+    @State private var frameStore = CardFrameStore()
+    /// Frozen copy of the live frames taken at lift time. All mid-drag
+    /// math uses this snapshot, because the live frames move with the
     /// make-room offsets.
     @State private var liftedFrames: [Int: CGRect] = [:]
 
@@ -234,17 +238,18 @@ struct TrainView: View {
                     .padding(.bottom, 14)
 
                 // ── Exercise cards ───────────────────────────────
-                // Hold the grip (≡) on a card and drag up/down to
+                // Hold anywhere on a card (~0.5s) and drag up/down to
                 // reorder today's exercises, home-screen style: the
-                // card lifts with a haptic, the others slide out of
-                // the way while you hover, and everything springs into
-                // place on release. The gesture is confined to the
-                // grip so plain scrolling never has to arbitrate
-                // against it. Reordering before starting the Live
-                // Activity means the Lock Screen card opens on the
-                // exercise the user actually does first.
+                // card lifts with a soft haptic, the others slide out
+                // of the way while you hover, and everything springs
+                // into place on release. Reordering before starting
+                // the Live Activity means the Lock Screen card opens
+                // on the exercise the user actually does first.
+                // Disabled while a Live Activity runs — its staged
+                // snapshot advances in start order.
                 VStack(spacing: Self.cardSpacing) {
                     ForEach(Array(exercises.enumerated()), id: \.offset) { idx, ex in
+                        let lifted = dragLiftedIndex == idx
                         exerciseCard(ex: ex, exIdx: idx)
                             .background(
                                 GeometryReader { geo in
@@ -254,16 +259,24 @@ struct TrainView: View {
                                     )
                                 }
                             )
-                            .offset(y: dragLiftedIndex == idx
-                                       ? dragTranslation
-                                       : makeRoomOffset(for: idx))
-                            .scaleEffect(dragLiftedIndex == idx ? 1.04 : 1)
-                            .shadow(color: .black.opacity(dragLiftedIndex == idx ? 0.45 : 0),
-                                    radius: 16, x: 0, y: 8)
-                            .zIndex(dragLiftedIndex == idx ? 10 : 0)
+                            .offset(y: lifted ? dragTranslation
+                                              : makeRoomOffset(for: idx))
+                            .scaleEffect(lifted ? 1.04 : 1)
+                            // Zero-radius clear shadow when idle — a
+                            // 16pt blur on every card is wasted GPU.
+                            .shadow(color: lifted ? .black.opacity(0.45) : .clear,
+                                    radius: lifted ? 16 : 0, x: 0, y: lifted ? 8 : 0)
+                            .zIndex(lifted ? 10 : 0)
+                            .gesture(
+                                reorderGesture(idx: idx),
+                                including: liveActivityActive ? .subviews : .all
+                            )
                     }
                 }
-                .onPreferenceChange(CardFramePreference.self) { cardFrames = $0 }
+                .onPreferenceChange(CardFramePreference.self) { [store = frameStore] in
+                    // Class write — no view invalidation, by design.
+                    store.frames = $0
+                }
                 .padding(.bottom, 16)
 
                 // ── Finish button ────────────────────────────────
@@ -471,17 +484,6 @@ struct TrainView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 weightPill(ex: ex, exKey: exKey, isExpanded: isExpanded)
-
-                // Reorder grip. The hold-and-drag gesture lives ONLY
-                // here — a vertical drag gesture spread across the whole
-                // card competes with the scroll view (both are vertical)
-                // and made scrolling feel sticky. Confining it to the
-                // grip gives scroll-anywhere + deliberate reordering.
-                // Hidden while a Live Activity runs (its staged snapshot
-                // advances in start order).
-                if !liveActivityActive {
-                    reorderHandle(exIdx: exIdx)
-                }
             }
 
             // ── Inline expand: weight stepper + rest timer chips ──
@@ -796,23 +798,13 @@ struct TrainView: View {
     /// Named coordinate space the card frames are measured in.
     private static let listSpace = "exerciseList"
 
-    /// The grip icon that owns the reorder gesture. Long-press it (soft
-    /// haptic confirms the lift), then drag — the card follows and the
-    /// others slide aside. Generous hit area for gym fingers.
-    private func reorderHandle(exIdx: Int) -> some View {
-        Image(systemName: "line.3.horizontal")
-            .font(.system(size: 14, weight: .heavy))
-            .foregroundColor(HexTheme.mute)
-            .frame(width: 30, height: 32)
-            .contentShape(Rectangle())
-            .gesture(reorderGesture(idx: exIdx))
-    }
-
-    /// Hold-then-drag on the grip, like rearranging icons on the iOS
-    /// home screen. The long press lifts the card (haptic + zoom); the
-    /// drag that follows moves it; releasing commits the reorder.
+    /// Hold-then-drag anywhere on the card, like rearranging icons on
+    /// the iOS home screen. The long press lifts the card (haptic +
+    /// zoom); the drag that follows moves it; releasing commits the
+    /// reorder. 0.5s hold (home-screen timing) so a finger resting
+    /// mid-scroll doesn't lift a card by accident.
     private func reorderGesture(idx: Int) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.35)
+        LongPressGesture(minimumDuration: 0.5)
             .sequenced(before: DragGesture(minimumDistance: 0))
             .onChanged { value in
                 switch value {
@@ -836,7 +828,7 @@ struct TrainView: View {
         guard dragLiftedIndex == nil else { return }
         // Small, soft tap — the "picked it up" cue.
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        liftedFrames      = cardFrames   // freeze base geometry
+        liftedFrames      = frameStore.frames   // freeze base geometry
         dragLiftedIndex   = idx
         dragProposedIndex = idx
         dragTranslation   = 0
@@ -1238,6 +1230,15 @@ private struct CardFramePreference: PreferenceKey {
                        nextValue: () -> [Int: CGRect]) {
         value.merge(nextValue(), uniquingKeysWith: { $1 })
     }
+}
+
+/// Sink for the live card frames. A reference type on purpose: the
+/// frames are viewport-relative, so they change on EVERY scrolled
+/// frame — funnelling that through @State re-rendered the entire tab
+/// at scroll framerate and made scrolling visibly laggy. Writes here
+/// invalidate nothing; `liftCard` reads `.frames` exactly once.
+private final class CardFrameStore {
+    var frames: [Int: CGRect] = [:]
 }
 
 // MARK: - Session Complete sheet
