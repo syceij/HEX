@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 /// Train tab — workout logger. Visual port of src/components/TodayTab.jsx.
 /// Header + Live Activity toggle + progress bar + exercise cards (each with
@@ -24,10 +23,26 @@ struct TrainView: View {
     @State private var timerDuration: Int = 0
     @State private var timerPaused: Bool = false
     @State private var liveActivityActive: Bool = false
-    /// Index of the exercise card currently being long-press-dragged to
-    /// a new position; nil when no drag is in flight. Drives the dimmed
-    /// look of the lifted card.
-    @State private var draggingIndex: Int? = nil
+
+    // ── Drag-to-reorder state (home-screen-style) ────────────────────
+    // Hold a card → it lifts (haptic + slight zoom); drag vertically →
+    // the OTHER cards spring out of the way live; release → everything
+    // settles. The exercises array is only mutated once, on release.
+    /// Index of the lifted card; nil when no reorder is in flight.
+    @State private var dragLiftedIndex: Int? = nil
+    /// Finger travel since the lift, applied raw to the lifted card so
+    /// it tracks the finger with zero animation lag.
+    @State private var dragTranslation: CGFloat = 0
+    /// Slot the lifted card would land in if released now — drives the
+    /// make-room offsets of every other card.
+    @State private var dragProposedIndex: Int? = nil
+    /// Live card frames (in the scroll view's space) from the layout
+    /// preference — refreshed continuously while idle.
+    @State private var cardFrames: [Int: CGRect] = [:]
+    /// Frozen copy of `cardFrames` taken at lift time. All mid-drag math
+    /// uses this snapshot, because the live frames move with the
+    /// make-room offsets.
+    @State private var liftedFrames: [Int: CGRect] = [:]
 
     /// Absolute instant the rest timer fires. The displayed countdown is
     /// derived from this against the wall clock — NOT a decrementing
@@ -88,6 +103,11 @@ struct TrainView: View {
                 // the digit is correct the instant the app reappears,
                 // not after the next 0.5s tick.
                 recomputeTimerRemaining()
+            } else if dragLiftedIndex != nil {
+                // Backgrounded mid-drag: iOS cancels the gesture without
+                // calling onEnded, which would strand a lifted card and
+                // a locked scroll view. Settle it where it hovers.
+                commitReorder()
             }
         }
         .onChange(of: app.liveActivityCompletions) { _ in
@@ -146,7 +166,10 @@ struct TrainView: View {
         completedSets      = [:]
         editedWeights      = [:]
         expandedKey        = nil
-        draggingIndex      = nil
+        dragLiftedIndex    = nil
+        dragProposedIndex  = nil
+        dragTranslation    = 0
+        liftedFrames       = [:]
         activeTimerKey     = nil
         restTimerChoice    = [:]
         timerRemaining     = 0
@@ -211,40 +234,40 @@ struct TrainView: View {
                     .padding(.bottom, 14)
 
                 // ── Exercise cards ───────────────────────────────
-                // Long-press a card and drag up/down to reorder today's
-                // exercises (e.g. start with Leg Press when the squat
-                // rack is taken). Reordering before starting the Live
-                // Activity means the Lock Screen card opens on the
-                // exercise the user actually does first. Disabled while
-                // a Live Activity is running — its staged snapshot was
-                // taken at start and advances in that order; letting the
-                // in-app order diverge mid-run would be confusing.
-                VStack(spacing: 12) {
+                // Hold a card and drag up/down to reorder today's
+                // exercises, home-screen style: the card lifts with a
+                // haptic, the others slide out of the way while you
+                // hover, and everything springs into place on release.
+                // Reordering before starting the Live Activity means
+                // the Lock Screen card opens on the exercise the user
+                // actually does first. Disabled while a Live Activity
+                // is running — its staged snapshot was taken at start
+                // and advances in that order.
+                VStack(spacing: Self.cardSpacing) {
                     ForEach(Array(exercises.enumerated()), id: \.offset) { idx, ex in
-                        if liveActivityActive {
-                            exerciseCard(ex: ex, exIdx: idx)
-                        } else {
-                            exerciseCard(ex: ex, exIdx: idx)
-                                .opacity(draggingIndex == idx ? 0.45 : 1)
-                                .onDrag {
-                                    draggingIndex = idx
-                                    return NSItemProvider(object: "\(idx)" as NSString)
+                        exerciseCard(ex: ex, exIdx: idx)
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear.preference(
+                                        key: CardFramePreference.self,
+                                        value: [idx: geo.frame(in: .named(Self.listSpace))]
+                                    )
                                 }
-                                .onDrop(of: [UTType.text],
-                                        delegate: ExerciseDropDelegate(
-                                            index: idx,
-                                            draggingIndex: $draggingIndex,
-                                            moveAction: { from, to in
-                                                performExerciseMove(from: from, to: to)
-                                            }))
-                        }
+                            )
+                            .offset(y: dragLiftedIndex == idx
+                                       ? dragTranslation
+                                       : makeRoomOffset(for: idx))
+                            .scaleEffect(dragLiftedIndex == idx ? 1.04 : 1)
+                            .shadow(color: .black.opacity(dragLiftedIndex == idx ? 0.45 : 0),
+                                    radius: 16, x: 0, y: 8)
+                            .zIndex(dragLiftedIndex == idx ? 10 : 0)
+                            .gesture(
+                                reorderGesture(idx: idx, count: exercises.count),
+                                including: liveActivityActive ? .subviews : .all
+                            )
                     }
                 }
-                // Fallback drop target: a drag released between cards
-                // (or on the container padding) lands here so the
-                // lifted card's dimmed state always clears.
-                .onDrop(of: [UTType.text],
-                        delegate: DragCancelDelegate(draggingIndex: $draggingIndex))
+                .onPreferenceChange(CardFramePreference.self) { cardFrames = $0 }
                 .padding(.bottom, 16)
 
                 // ── Finish button ────────────────────────────────
@@ -255,6 +278,11 @@ struct TrainView: View {
             .padding(.horizontal, 20)
             .padding(.top, 20)
         }
+        // While a card is lifted the vertical drag belongs to the
+        // reorder, not the scroll — exactly like the home screen, which
+        // also doesn't scroll while you're holding an icon still.
+        .scrollDisabled(dragLiftedIndex != nil)
+        .coordinateSpace(name: Self.listSpace)
     }
 
     // MARK: - Live Activity button
@@ -753,7 +781,112 @@ struct TrainView: View {
         }
     }
 
-    // MARK: - Drag-to-reorder
+    // MARK: - Drag-to-reorder (home-screen-style)
+
+    /// Spacing of the exercise VStack — the make-room shift is one card
+    /// height plus this.
+    private static let cardSpacing: CGFloat = 12
+    /// Named coordinate space the card frames are measured in.
+    private static let listSpace = "exerciseList"
+
+    /// Hold-then-drag, like rearranging icons on the iOS home screen.
+    /// The long press lifts the card (haptic + zoom); the drag that
+    /// follows moves it; releasing commits the reorder. Starting to
+    /// scroll before the hold completes keeps normal scrolling.
+    private func reorderGesture(idx: Int, count: Int) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.35)
+            .sequenced(before: DragGesture(minimumDistance: 0))
+            .onChanged { value in
+                switch value {
+                case .first(true):
+                    // Hold recognised — lift the card before any travel.
+                    liftCard(idx)
+                case .second(true, let drag):
+                    if dragLiftedIndex == nil { liftCard(idx) }
+                    dragTranslation = drag?.translation.height ?? 0
+                    updateProposedIndex(count: count)
+                default:
+                    break
+                }
+            }
+            .onEnded { _ in
+                commitReorder()
+            }
+    }
+
+    private func liftCard(_ idx: Int) {
+        guard dragLiftedIndex == nil else { return }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        liftedFrames      = cardFrames   // freeze base geometry
+        dragLiftedIndex   = idx
+        dragProposedIndex = idx
+        dragTranslation   = 0
+    }
+
+    /// Recompute which slot the lifted card is hovering over, using the
+    /// frozen lift-time frames. Animating only this state change is what
+    /// makes the OTHER cards spring aside while the lifted card itself
+    /// keeps tracking the finger raw.
+    private func updateProposedIndex(count: Int) {
+        guard let from = dragLiftedIndex,
+              let dragged = liftedFrames[from] else { return }
+        let centerY = dragged.midY + dragTranslation
+
+        var proposed = from
+        if let top = liftedFrames.values.map(\.minY).min(), centerY < top {
+            proposed = 0
+        } else if let bottom = liftedFrames.values.map(\.maxY).max(), centerY > bottom {
+            proposed = count - 1
+        } else {
+            for (i, frame) in liftedFrames
+            where centerY >= frame.minY && centerY <= frame.maxY {
+                proposed = i
+                break
+            }
+        }
+
+        if proposed != dragProposedIndex {
+            // Selection tick, same as the home screen's reorder feedback.
+            UISelectionFeedbackGenerator().selectionChanged()
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
+                dragProposedIndex = proposed
+            }
+        }
+    }
+
+    /// How far a NON-lifted card must shift to open the gap under the
+    /// finger. Cards between the lifted card's old slot and the proposed
+    /// slot move by one lifted-card height (+ spacing); everything else
+    /// stays put.
+    private func makeRoomOffset(for idx: Int) -> CGFloat {
+        guard let from = dragLiftedIndex,
+              let to = dragProposedIndex,
+              idx != from,
+              let dragged = liftedFrames[from] else { return 0 }
+        let delta = dragged.height + Self.cardSpacing
+        if from < to, idx > from, idx <= to { return -delta }
+        if to < from, idx >= to, idx < from { return  delta }
+        return 0
+    }
+
+    /// Release: mutate the exercises array once (with the index-key
+    /// remap) and clear the drag state inside the same animation so the
+    /// lifted card glides into its slot as the offsets unwind.
+    private func commitReorder() {
+        let from = dragLiftedIndex
+        let to   = dragProposedIndex
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            if let f = from, let t = to, f != t {
+                performExerciseMove(from: f, to: t)
+            }
+            dragLiftedIndex   = nil
+            dragProposedIndex = nil
+            dragTranslation   = 0
+        }
+        if let f = from, let t = to, f != t {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+    }
 
     /// Move an exercise card from one position to another. The critical
     /// part is remapping every index-keyed @State dictionary FIRST —
@@ -775,9 +908,7 @@ struct TrainView: View {
         for (newIdx, oldIdx) in order.enumerated() { mapping[oldIdx] = newIdx }
 
         remapPerExerciseState(mapping: mapping)
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-            app.moveCurrentSessionExercise(from: from, to: to)
-        }
+        app.moveCurrentSessionExercise(from: from, to: to)
     }
 
     /// Rewrite the leading "<exIdx>_" of every per-exercise key through
@@ -1078,42 +1209,14 @@ private struct FlexRow<Content: View>: View {
     }
 }
 
-/// Drop delegate for the exercise drag-to-reorder. `dropEntered` fires
-/// when the lifted card hovers over this card — we move it there right
-/// away (live reorder, like Reminders) instead of waiting for the drop,
-/// and update `draggingIndex` so subsequent hovers compute from the new
-/// position. `performDrop` just ends the drag.
-private struct ExerciseDropDelegate: DropDelegate {
-    let index: Int
-    @Binding var draggingIndex: Int?
-    let moveAction: (Int, Int) -> Void
-
-    func dropEntered(info: DropInfo) {
-        guard let from = draggingIndex, from != index else { return }
-        moveAction(from, index)
-        draggingIndex = index
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .move)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        draggingIndex = nil
-        return true
-    }
-}
-
-/// Container-level fallback: absorbs drops that land outside every card
-/// so `draggingIndex` (and the dimmed card it drives) always resets.
-private struct DragCancelDelegate: DropDelegate {
-    @Binding var draggingIndex: Int?
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .move)
-    }
-    func performDrop(info: DropInfo) -> Bool {
-        draggingIndex = nil
-        return true
+/// Reports each exercise card's frame (in the scroll view's named
+/// coordinate space) up to TrainView, which uses a lift-time snapshot
+/// of them to drive the home-screen-style reorder math.
+private struct CardFramePreference: PreferenceKey {
+    static var defaultValue: [Int: CGRect] = [:]
+    static func reduce(value: inout [Int: CGRect],
+                       nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
     }
 }
 
