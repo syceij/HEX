@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Train tab — workout logger. Visual port of src/components/TodayTab.jsx.
 /// Header + Live Activity toggle + progress bar + exercise cards (each with
@@ -23,6 +24,10 @@ struct TrainView: View {
     @State private var timerDuration: Int = 0
     @State private var timerPaused: Bool = false
     @State private var liveActivityActive: Bool = false
+    /// Index of the exercise card currently being long-press-dragged to
+    /// a new position; nil when no drag is in flight. Drives the dimmed
+    /// look of the lifted card.
+    @State private var draggingIndex: Int? = nil
 
     /// Absolute instant the rest timer fires. The displayed countdown is
     /// derived from this against the wall clock — NOT a decrementing
@@ -141,6 +146,7 @@ struct TrainView: View {
         completedSets      = [:]
         editedWeights      = [:]
         expandedKey        = nil
+        draggingIndex      = nil
         activeTimerKey     = nil
         restTimerChoice    = [:]
         timerRemaining     = 0
@@ -205,11 +211,40 @@ struct TrainView: View {
                     .padding(.bottom, 14)
 
                 // ── Exercise cards ───────────────────────────────
+                // Long-press a card and drag up/down to reorder today's
+                // exercises (e.g. start with Leg Press when the squat
+                // rack is taken). Reordering before starting the Live
+                // Activity means the Lock Screen card opens on the
+                // exercise the user actually does first. Disabled while
+                // a Live Activity is running — its staged snapshot was
+                // taken at start and advances in that order; letting the
+                // in-app order diverge mid-run would be confusing.
                 VStack(spacing: 12) {
                     ForEach(Array(exercises.enumerated()), id: \.offset) { idx, ex in
-                        exerciseCard(ex: ex, exIdx: idx)
+                        if liveActivityActive {
+                            exerciseCard(ex: ex, exIdx: idx)
+                        } else {
+                            exerciseCard(ex: ex, exIdx: idx)
+                                .opacity(draggingIndex == idx ? 0.45 : 1)
+                                .onDrag {
+                                    draggingIndex = idx
+                                    return NSItemProvider(object: "\(idx)" as NSString)
+                                }
+                                .onDrop(of: [UTType.text],
+                                        delegate: ExerciseDropDelegate(
+                                            index: idx,
+                                            draggingIndex: $draggingIndex,
+                                            moveAction: { from, to in
+                                                performExerciseMove(from: from, to: to)
+                                            }))
+                        }
                     }
                 }
+                // Fallback drop target: a drag released between cards
+                // (or on the container padding) lands here so the
+                // lifted card's dimmed state always clears.
+                .onDrop(of: [UTType.text],
+                        delegate: DragCancelDelegate(draggingIndex: $draggingIndex))
                 .padding(.bottom, 16)
 
                 // ── Finish button ────────────────────────────────
@@ -680,6 +715,10 @@ struct TrainView: View {
         if nowDone {
             // Light haptic confirms the tap registered as "set done".
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            // Stamp the instant into the active-training-time timeline
+            // (persisted per session, survives an app kill). Unticking
+            // doesn't remove stamps — a tick is activity either way.
+            app.recordSetTick()
             let allDone = (0..<ex.sets).allSatisfy { completedSets["\(exKey)_\($0)"] == true }
             if allDone {
                 // Stronger haptic when the whole exercise is finished.
@@ -712,6 +751,53 @@ struct TrainView: View {
                 )
             }
         }
+    }
+
+    // MARK: - Drag-to-reorder
+
+    /// Move an exercise card from one position to another. The critical
+    /// part is remapping every index-keyed @State dictionary FIRST —
+    /// completedSets / editedWeights / restTimerChoice are all keyed
+    /// "<exIdx>_<name>…", so without the remap a reorder would visually
+    /// hand one exercise's checkmarks and weight override to whatever
+    /// exercise landed on its old index.
+    private func performExerciseMove(from: Int, to: Int) {
+        guard from != to,
+              let exercises = app.currentSession?.data?.exercises,
+              exercises.indices.contains(from),
+              exercises.indices.contains(to) else { return }
+
+        // Mirror the array move on plain indices to get old→new mapping.
+        var order = Array(exercises.indices)
+        let moved = order.remove(at: from)
+        order.insert(moved, at: to)
+        var mapping: [Int: Int] = [:]
+        for (newIdx, oldIdx) in order.enumerated() { mapping[oldIdx] = newIdx }
+
+        remapPerExerciseState(mapping: mapping)
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+            app.moveCurrentSessionExercise(from: from, to: to)
+        }
+    }
+
+    /// Rewrite the leading "<exIdx>_" of every per-exercise key through
+    /// the index mapping. Names can contain underscores, so only the
+    /// prefix up to the FIRST underscore is parsed as the index.
+    private func remapPerExerciseState(mapping: [Int: Int]) {
+        func remap(_ key: String) -> String {
+            guard let underscore = key.firstIndex(of: "_"),
+                  let oldIdx = Int(key[key.startIndex..<underscore]),
+                  let newIdx = mapping[oldIdx] else { return key }
+            return "\(newIdx)\(key[underscore...])"
+        }
+        completedSets   = Dictionary(uniqueKeysWithValues:
+                                        completedSets.map { (remap($0.key), $0.value) })
+        editedWeights   = Dictionary(uniqueKeysWithValues:
+                                        editedWeights.map { (remap($0.key), $0.value) })
+        restTimerChoice = Dictionary(uniqueKeysWithValues:
+                                        restTimerChoice.map { (remap($0.key), $0.value) })
+        if let e = expandedKey     { expandedKey    = remap(e) }
+        if let t = activeTimerKey  { activeTimerKey = remap(t) }
     }
 
     // MARK: - Rest timer ring
@@ -891,6 +977,15 @@ struct TrainView: View {
             }
         }
 
+        // Active training time: every recorded set-tick instant (in-app
+        // taps + Lock-Screen taps with their real timestamps) plus "now"
+        // as the closing endpoint — the user is tapping Finish, so the
+        // workout demonstrably extends to this moment. The gap-capped
+        // sum inside activeTrainingSeconds discards any gap > 30 min,
+        // so a stray tick made hours ago outside the gym adds nothing.
+        let tickTimes = app.setTickTimes(for: session.id)
+        let durationSeconds = AppState.activeTrainingSeconds(tickTimes + [Date()])
+
         let completedSession = WorkoutSession(
             id:          session.id,
             userId:      session.userId,
@@ -900,7 +995,9 @@ struct TrainView: View {
             weekNumber:  session.weekNumber,
             block:       session.block,
             completed:   true,
-            data:        WorkoutSessionData(exercises: finalExercises),
+            data:        WorkoutSessionData(exercises: finalExercises,
+                                            durationSeconds: durationSeconds > 0
+                                                             ? durationSeconds : nil),
             createdAt:   session.createdAt
         )
 
@@ -925,6 +1022,7 @@ struct TrainView: View {
             sessionName: completedSession.name,
             setsDone: doneSets,
             volumeKg: volumeKg,
+            durationSeconds: durationSeconds > 0 ? durationSeconds : nil,
             exercises: summaryExercises
         )
 
@@ -980,6 +1078,45 @@ private struct FlexRow<Content: View>: View {
     }
 }
 
+/// Drop delegate for the exercise drag-to-reorder. `dropEntered` fires
+/// when the lifted card hovers over this card — we move it there right
+/// away (live reorder, like Reminders) instead of waiting for the drop,
+/// and update `draggingIndex` so subsequent hovers compute from the new
+/// position. `performDrop` just ends the drag.
+private struct ExerciseDropDelegate: DropDelegate {
+    let index: Int
+    @Binding var draggingIndex: Int?
+    let moveAction: (Int, Int) -> Void
+
+    func dropEntered(info: DropInfo) {
+        guard let from = draggingIndex, from != index else { return }
+        moveAction(from, index)
+        draggingIndex = index
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingIndex = nil
+        return true
+    }
+}
+
+/// Container-level fallback: absorbs drops that land outside every card
+/// so `draggingIndex` (and the dimmed card it drives) always resets.
+private struct DragCancelDelegate: DropDelegate {
+    @Binding var draggingIndex: Int?
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+    func performDrop(info: DropInfo) -> Bool {
+        draggingIndex = nil
+        return true
+    }
+}
+
 // MARK: - Session Complete sheet
 
 /// Modal shown after the user taps "Finish Session" in TrainView. Mirrors
@@ -993,6 +1130,10 @@ struct SessionCompleteView: View {
     let summary: SessionSummary
     @EnvironmentObject var app: AppState
     @State private var saving = false
+    /// Pre-rendered share card (square, branded) — built once when the
+    /// sheet appears so the ShareLink has its payload ready by the time
+    /// the user can reach the button.
+    @State private var shareImage: UIImage? = nil
 
     private var ar: Bool { app.language == "ar" }
 
@@ -1008,7 +1149,7 @@ struct SessionCompleteView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
 
-                    // ── Banner ────────────────────────────────────
+                    // ── Banner + share ────────────────────────────
                     HStack(spacing: 8) {
                         Image(systemName: "checkmark.seal.fill")
                             .font(.system(size: 14, weight: .bold))
@@ -1017,6 +1158,30 @@ struct SessionCompleteView: View {
                             .font(.system(size: 11, weight: .heavy))
                             .kerning(ar ? 0 : 1.2)
                             .foregroundColor(HexTheme.accent)
+                        Spacer()
+                        // Share the summary as a branded image — built
+                        // for "look, I did my gym today" stories/DMs.
+                        if let img = shareImage {
+                            ShareLink(
+                                item: Image(uiImage: img),
+                                preview: SharePreview(
+                                    summary.sessionName,
+                                    image: Image(uiImage: img)
+                                )
+                            ) {
+                                Image(systemName: "square.and.arrow.up")
+                                    .font(.system(size: 14, weight: .heavy))
+                                    .foregroundColor(HexTheme.accent)
+                                    .frame(width: 34, height: 34)
+                                    .background(
+                                        Circle().fill(HexTheme.accent.opacity(0.10))
+                                    )
+                                    .overlay(
+                                        Circle().stroke(HexTheme.accent.opacity(0.35),
+                                                        lineWidth: 1.5)
+                                    )
+                            }
+                        }
                     }
 
                     // ── Session name ──────────────────────────────
@@ -1032,6 +1197,15 @@ struct SessionCompleteView: View {
                             value: "\(summary.setsDone)",
                             label: ar ? "مجموعات" : "SETS"
                         )
+                        // Active training time — hidden when the tick
+                        // timeline had no real activity window (e.g.
+                        // every set logged retroactively in one burst).
+                        if let d = summary.durationSeconds, d > 0 {
+                            statCard(
+                                value: Self.formatDuration(d, ar: ar),
+                                label: ar ? "الوقت" : "TIME"
+                            )
+                        }
                         statCard(
                             value: formatVolume(summary.volumeKg),
                             label: ar ? "الحجم" : "VOLUME"
@@ -1124,6 +1298,34 @@ struct SessionCompleteView: View {
             }
         }
         .background(HexTheme.bg.ignoresSafeArea())
+        .onAppear {
+            // Render the share card once. ImageRenderer is synchronous
+            // and the card is a static layout — cheap enough to do
+            // inline on appear.
+            if shareImage == nil {
+                let renderer = ImageRenderer(
+                    content: SessionShareCard(summary: summary, ar: ar)
+                )
+                renderer.scale = 3
+                renderer.isOpaque = true
+                shareImage = renderer.uiImage
+            }
+        }
+    }
+
+    /// "47m" under an hour, "1h 12m" above (Arabic: "47د" / "1س 12د" —
+    /// same abbreviation style the activity feed already uses, e.g.
+    /// "منذ 18س"). Rounds to whole minutes, floor 1m so a sub-minute
+    /// burst doesn't display as zero.
+    static func formatDuration(_ seconds: Int, ar: Bool) -> String {
+        let mins = max(1, Int((Double(seconds) / 60.0).rounded()))
+        if mins < 60 {
+            return ar ? "\(mins)د" : "\(mins)m"
+        }
+        let h = mins / 60
+        let r = mins % 60
+        if r == 0 { return ar ? "\(h)س" : "\(h)h" }
+        return ar ? "\(h)س \(r)د" : "\(h)h \(r)m"
     }
 
     // MARK: - Pieces
@@ -1182,5 +1384,169 @@ struct SessionCompleteView: View {
                 : String(format: "%.1ft", tonnes)
         }
         return "\(rounded) kg"
+    }
+}
+
+// MARK: - Shareable summary card
+
+/// The branded workout-summary image built for the share sheet — logo,
+/// session name, date, stat row, final weights, slogan footer. Rendered
+/// off-screen via `ImageRenderer` (never shown in the view hierarchy),
+/// so everything it needs comes in through plain `let`s — @Environment /
+/// @EnvironmentObject would read defaults, not the app's values.
+private struct SessionShareCard: View {
+    let summary: SessionSummary
+    let ar: Bool
+
+    /// Cap the weights list so a 12-exercise session can't stretch the
+    /// card into an unshareable ribbon.
+    private static let maxWeightRows = 8
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+
+            // ── Logo + date ───────────────────────────────────────
+            HStack(alignment: .center) {
+                Image("LoadingLogo")
+                    .renderingMode(.template)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 46, height: 46)
+                    .foregroundColor(HexTheme.accent)
+                Spacer()
+                Text(dateText)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(HexTheme.dim)
+            }
+
+            // ── Banner + session name ─────────────────────────────
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 7) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(HexTheme.accent)
+                    Text(ar ? "اكتملت الجلسة" : "SESSION COMPLETE")
+                        .font(.system(size: 11, weight: .heavy))
+                        .kerning(ar ? 0 : 1.2)
+                        .foregroundColor(HexTheme.accent)
+                }
+                Text(summary.sessionName)
+                    .font(.system(size: 34, weight: .heavy))
+                    .foregroundColor(HexTheme.text)
+            }
+
+            // ── Stats ─────────────────────────────────────────────
+            HStack(spacing: 10) {
+                stat(value: "\(summary.setsDone)",
+                     label: ar ? "مجموعات" : "SETS")
+                if let d = summary.durationSeconds, d > 0 {
+                    stat(value: SessionCompleteView.formatDuration(d, ar: ar),
+                         label: ar ? "الوقت" : "TIME")
+                }
+                stat(value: volumeText,
+                     label: ar ? "الحجم" : "VOLUME")
+            }
+
+            // ── Final weights ─────────────────────────────────────
+            if !summary.exercises.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(summary.exercises.prefix(Self.maxWeightRows)
+                                    .enumerated()),
+                            id: \.offset) { _, line in
+                        HStack {
+                            Text(line.name)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(HexTheme.text)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(weightText(line))
+                                .font(.system(size: 13, weight: .heavy))
+                                .foregroundColor(line.bodyweight
+                                                 ? HexTheme.mute : HexTheme.accent)
+                        }
+                        .padding(.vertical, 8)
+                    }
+                    if summary.exercises.count > Self.maxWeightRows {
+                        Text(ar
+                             ? "+\(summary.exercises.count - Self.maxWeightRows) أخرى"
+                             : "+\(summary.exercises.count - Self.maxWeightRows) more")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(HexTheme.mute)
+                            .padding(.top, 4)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(HexTheme.surface2)
+                )
+            }
+
+            // ── Slogan footer ─────────────────────────────────────
+            HStack {
+                Text("HEX")
+                    .font(.system(size: 14, weight: .heavy))
+                    .kerning(2)
+                    .foregroundColor(HexTheme.text)
+                Spacer()
+                Text("PROGRESS IS PLANED")
+                    .font(.system(size: 10, weight: .heavy))
+                    .kerning(1.6)
+                    .foregroundColor(HexTheme.accent)
+            }
+            .padding(.top, 2)
+        }
+        .padding(26)
+        .frame(width: 420)
+        .background(HexTheme.bg)
+        .environment(\.layoutDirection, ar ? .rightToLeft : .leftToRight)
+    }
+
+    // MARK: pieces
+
+    private func stat(value: String, label: String) -> some View {
+        VStack(spacing: 4) {
+            Text(value)
+                .font(.system(size: 23, weight: .heavy))
+                .foregroundColor(HexTheme.text)
+            Text(label)
+                .font(.system(size: 10, weight: .heavy))
+                .kerning(ar ? 0 : 0.8)
+                .foregroundColor(HexTheme.dim)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 14)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(HexTheme.surface2)
+        )
+    }
+
+    private var dateText: String {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: ar ? "ar" : "en_US")
+        f.dateFormat = ar ? "d MMMM yyyy" : "MMM d, yyyy"
+        return f.string(from: summary.session.date)
+    }
+
+    private var volumeText: String {
+        let rounded = Int(summary.volumeKg.rounded())
+        if rounded >= 1000 {
+            let tonnes = Double(rounded) / 1000.0
+            return tonnes == tonnes.rounded()
+                ? "\(Int(tonnes))t"
+                : String(format: "%.1ft", tonnes)
+        }
+        return "\(rounded) kg"
+    }
+
+    private func weightText(_ line: SessionSummary.ExerciseLine) -> String {
+        if line.bodyweight { return ar ? "وزن الجسم" : "BW" }
+        guard let w = line.weightKg, w > 0 else { return "—" }
+        return w == w.rounded()
+            ? "\(Int(w)) kg"
+            : String(format: "%.1f kg", w)
     }
 }

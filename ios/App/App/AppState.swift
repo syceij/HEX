@@ -348,6 +348,11 @@ final class AppState: ObservableObject {
             // because that's what TrainView's exKey_<i> uses.
             let idx = max(0, p.setNumber - 1)
             map[p.exerciseName, default: []].insert(idx)
+            // Feed the Lock-Screen tap's REAL timestamp into the
+            // active-training-time store. The queue persists until
+            // drain, so this re-runs on every foreground — the store
+            // dedups identical instants, making the repeat harmless.
+            recordSetTick(at: p.completedAt, sessionId: p.sessionId)
         }
 
         // (2) Currently-visible exercise on the LA card — its
@@ -479,6 +484,11 @@ final class AppState: ObservableObject {
                 bodyweight: dto.bodyweight
             )
         }
+        // Active training time straight from the Lock-Screen taps' real
+        // instants. No "now" endpoint here — this path can run the next
+        // morning when the user finally reopens the app, so the last
+        // tick IS the end of the workout.
+        let duration = Self.activeTrainingSeconds(pending.map(\.completedAt))
         let session = WorkoutSession(
             id:          staged.sessionId,
             userId:      uid,
@@ -488,7 +498,8 @@ final class AppState: ObservableObject {
             weekNumber:  staged.weekNumber,
             block:       staged.block,
             completed:   true,
-            data:        WorkoutSessionData(exercises: exercises),
+            data:        WorkoutSessionData(exercises: exercises,
+                                            durationSeconds: duration > 0 ? duration : nil),
             createdAt:   nil
         )
         let setRows: [PerformedSet] = pending.map { p in
@@ -1196,6 +1207,70 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Active training time
+    //
+    // Duration is computed from the timestamps of set ticks, NOT from a
+    // start/end pair — a single stray tick outside the gym would poison
+    // an endpoint-based span. Instead we sum only the gaps between
+    // consecutive ticks that are ≤ 30 minutes; longer gaps count as
+    // "not training" and contribute zero. Ticks are persisted per
+    // session id (UserDefaults) so an app kill mid-workout doesn't lose
+    // the timeline; Lock-Screen Live Activity taps flow in with their
+    // real `completedAt` instants via `refreshLiveActivityCompletions`.
+
+    private static let setTickStoreKey = "hex.set_tick_times_v1"
+    /// Drop a session's tick timeline once its newest tick is older than
+    /// this — keeps the store from accumulating abandoned sessions.
+    private static let tickStoreMaxAge: TimeInterval = 48 * 3600
+
+    /// Record one set-tick instant for a session (defaults to the
+    /// current staged session, "now"). Dedups identical instants so
+    /// re-merging the Live Activity queue can't double-record.
+    func recordSetTick(at date: Date = Date(), sessionId: UUID? = nil) {
+        guard let sid = sessionId ?? currentSession?.id else { return }
+        var store = (UserDefaults.standard.dictionary(forKey: Self.setTickStoreKey)
+                     as? [String: [Double]]) ?? [:]
+        var times = store[sid.uuidString] ?? []
+        let epoch = date.timeIntervalSince1970
+        guard !times.contains(epoch) else { return }
+        times.append(epoch)
+        store[sid.uuidString] = times
+        // Prune sessions whose latest activity is ancient.
+        let cutoff = Date().timeIntervalSince1970 - Self.tickStoreMaxAge
+        store = store.filter { (_, v) in (v.max() ?? 0) >= cutoff }
+        UserDefaults.standard.set(store, forKey: Self.setTickStoreKey)
+    }
+
+    /// All recorded tick instants for a session, unsorted.
+    func setTickTimes(for sessionId: UUID) -> [Date] {
+        let store = (UserDefaults.standard.dictionary(forKey: Self.setTickStoreKey)
+                     as? [String: [Double]]) ?? [:]
+        return (store[sessionId.uuidString] ?? []).map(Date.init(timeIntervalSince1970:))
+    }
+
+    /// Forget a session's tick timeline (called after a successful save).
+    func clearSetTickTimes(for sessionId: UUID) {
+        var store = (UserDefaults.standard.dictionary(forKey: Self.setTickStoreKey)
+                     as? [String: [Double]]) ?? [:]
+        store.removeValue(forKey: sessionId.uuidString)
+        UserDefaults.standard.set(store, forKey: Self.setTickStoreKey)
+    }
+
+    /// Gap-capped sum: sort the instants, then add up only the
+    /// consecutive gaps that are ≤ `maxGap` (default 30 min). Returns
+    /// whole seconds — 0 when there's no real activity window.
+    static func activeTrainingSeconds(_ times: [Date],
+                                      maxGap: TimeInterval = 1800) -> Int {
+        guard times.count >= 2 else { return 0 }
+        let sorted = times.map(\.timeIntervalSince1970).sorted()
+        var total: TimeInterval = 0
+        for i in 1..<sorted.count {
+            let gap = sorted[i] - sorted[i - 1]
+            if gap > 0, gap <= maxGap { total += gap }
+        }
+        return Int(total.rounded())
+    }
+
     /// User tapped "Save Session" inside the Session Complete sheet.
     /// Persists the workout, fires confetti + toast, and clears the
     /// summary so the sheet dismisses. Wraps `finishWorkout` so the
@@ -1245,6 +1320,9 @@ final class AppState: ObservableObject {
         try await SupabaseManager.shared.saveWorkoutSession(session)
         try await SupabaseManager.shared.savePerformedSets(sets)
         currentSession = nil
+        // The session is durably saved — its set-tick timeline has served
+        // its purpose (durationSeconds is already inside session.data).
+        clearSetTickTimes(for: session.id)
 
         // Update working_weights with the heaviest non-bodyweight load per
         // exercise. Key by `ex.name.trim()` (matches React App.jsx:836)
@@ -1903,6 +1981,23 @@ final class AppState: ObservableObject {
         currentSession = session
     }
 
+    /// Move an exercise within the staged session (drag-to-reorder in
+    /// TrainView). In-memory only — like every other staged-session
+    /// mutation, nothing persists until the user finishes the workout.
+    /// TrainView remaps its index-keyed UI state (completedSets etc.)
+    /// before calling this so ticked sets follow their exercise.
+    func moveCurrentSessionExercise(from: Int, to: Int) {
+        guard from != to,
+              var session = currentSession,
+              var data = session.data,
+              data.exercises.indices.contains(from),
+              data.exercises.indices.contains(to) else { return }
+        let moved = data.exercises.remove(at: from)
+        data.exercises.insert(moved, at: to)
+        session.data = data
+        currentSession = session
+    }
+
     /// Add `deltaKg` to the matching exercise in the current session (by
     /// name or library-key heuristic).  Persists no DB writes — the change
     /// lives in `currentSession` only until the user finishes the workout.
@@ -1980,6 +2075,10 @@ struct SessionSummary: Identifiable, Hashable {
     let sessionName: String
     let setsDone: Int
     let volumeKg: Double
+    /// Active training time (gap-capped set-tick sum). nil/0 when the
+    /// tick timeline contains no real activity window — the sheet hides
+    /// the TIME box rather than showing a meaningless value.
+    let durationSeconds: Int?
     let exercises: [ExerciseLine]
 
     /// One line in the "Final weights" recap inside the sheet.

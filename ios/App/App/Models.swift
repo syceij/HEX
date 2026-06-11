@@ -637,6 +637,13 @@ struct WorkoutSession: Codable, Identifiable, Hashable {
 /// Snapshot of exercises/sets attached to a session (JSONB).
 struct WorkoutSessionData: Codable, Hashable {
     var exercises: [Exercise]
+    /// Active training time in seconds — the gap-capped sum of intervals
+    /// between consecutive set ticks (gaps over 30 min are treated as
+    /// "not training" and contribute nothing, so a stray tick outside
+    /// the gym can't inflate the number). Optional: rows saved before
+    /// this feature existed have no value, and the React app ignores
+    /// the extra JSON key.
+    var durationSeconds: Int? = nil
 }
 
 // MARK: - Set
