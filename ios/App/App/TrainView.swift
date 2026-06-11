@@ -234,15 +234,15 @@ struct TrainView: View {
                     .padding(.bottom, 14)
 
                 // ── Exercise cards ───────────────────────────────
-                // Hold a card and drag up/down to reorder today's
-                // exercises, home-screen style: the card lifts with a
-                // haptic, the others slide out of the way while you
-                // hover, and everything springs into place on release.
-                // Reordering before starting the Live Activity means
-                // the Lock Screen card opens on the exercise the user
-                // actually does first. Disabled while a Live Activity
-                // is running — its staged snapshot was taken at start
-                // and advances in that order.
+                // Hold the grip (≡) on a card and drag up/down to
+                // reorder today's exercises, home-screen style: the
+                // card lifts with a haptic, the others slide out of
+                // the way while you hover, and everything springs into
+                // place on release. The gesture is confined to the
+                // grip so plain scrolling never has to arbitrate
+                // against it. Reordering before starting the Live
+                // Activity means the Lock Screen card opens on the
+                // exercise the user actually does first.
                 VStack(spacing: Self.cardSpacing) {
                     ForEach(Array(exercises.enumerated()), id: \.offset) { idx, ex in
                         exerciseCard(ex: ex, exIdx: idx)
@@ -261,10 +261,6 @@ struct TrainView: View {
                             .shadow(color: .black.opacity(dragLiftedIndex == idx ? 0.45 : 0),
                                     radius: 16, x: 0, y: 8)
                             .zIndex(dragLiftedIndex == idx ? 10 : 0)
-                            .gesture(
-                                reorderGesture(idx: idx, count: exercises.count),
-                                including: liveActivityActive ? .subviews : .all
-                            )
                     }
                 }
                 .onPreferenceChange(CardFramePreference.self) { cardFrames = $0 }
@@ -475,6 +471,17 @@ struct TrainView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 weightPill(ex: ex, exKey: exKey, isExpanded: isExpanded)
+
+                // Reorder grip. The hold-and-drag gesture lives ONLY
+                // here — a vertical drag gesture spread across the whole
+                // card competes with the scroll view (both are vertical)
+                // and made scrolling feel sticky. Confining it to the
+                // grip gives scroll-anywhere + deliberate reordering.
+                // Hidden while a Live Activity runs (its staged snapshot
+                // advances in start order).
+                if !liveActivityActive {
+                    reorderHandle(exIdx: exIdx)
+                }
             }
 
             // ── Inline expand: weight stepper + rest timer chips ──
@@ -789,11 +796,22 @@ struct TrainView: View {
     /// Named coordinate space the card frames are measured in.
     private static let listSpace = "exerciseList"
 
-    /// Hold-then-drag, like rearranging icons on the iOS home screen.
-    /// The long press lifts the card (haptic + zoom); the drag that
-    /// follows moves it; releasing commits the reorder. Starting to
-    /// scroll before the hold completes keeps normal scrolling.
-    private func reorderGesture(idx: Int, count: Int) -> some Gesture {
+    /// The grip icon that owns the reorder gesture. Long-press it (soft
+    /// haptic confirms the lift), then drag — the card follows and the
+    /// others slide aside. Generous hit area for gym fingers.
+    private func reorderHandle(exIdx: Int) -> some View {
+        Image(systemName: "line.3.horizontal")
+            .font(.system(size: 14, weight: .heavy))
+            .foregroundColor(HexTheme.mute)
+            .frame(width: 30, height: 32)
+            .contentShape(Rectangle())
+            .gesture(reorderGesture(idx: exIdx))
+    }
+
+    /// Hold-then-drag on the grip, like rearranging icons on the iOS
+    /// home screen. The long press lifts the card (haptic + zoom); the
+    /// drag that follows moves it; releasing commits the reorder.
+    private func reorderGesture(idx: Int) -> some Gesture {
         LongPressGesture(minimumDuration: 0.35)
             .sequenced(before: DragGesture(minimumDistance: 0))
             .onChanged { value in
@@ -804,7 +822,7 @@ struct TrainView: View {
                 case .second(true, let drag):
                     if dragLiftedIndex == nil { liftCard(idx) }
                     dragTranslation = drag?.translation.height ?? 0
-                    updateProposedIndex(count: count)
+                    updateProposedIndex()
                 default:
                     break
                 }
@@ -816,7 +834,8 @@ struct TrainView: View {
 
     private func liftCard(_ idx: Int) {
         guard dragLiftedIndex == nil else { return }
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        // Small, soft tap — the "picked it up" cue.
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
         liftedFrames      = cardFrames   // freeze base geometry
         dragLiftedIndex   = idx
         dragProposedIndex = idx
@@ -827,9 +846,10 @@ struct TrainView: View {
     /// frozen lift-time frames. Animating only this state change is what
     /// makes the OTHER cards spring aside while the lifted card itself
     /// keeps tracking the finger raw.
-    private func updateProposedIndex(count: Int) {
+    private func updateProposedIndex() {
         guard let from = dragLiftedIndex,
               let dragged = liftedFrames[from] else { return }
+        let count = liftedFrames.count
         let centerY = dragged.midY + dragTranslation
 
         var proposed = from
