@@ -25,14 +25,20 @@ struct TrainView: View {
     @State private var liveActivityActive: Bool = false
 
     // ── Drag-to-reorder state (home-screen-style) ────────────────────
-    // Hold a card → it lifts (haptic + slight zoom); drag vertically →
-    // the OTHER cards spring out of the way live; release → everything
-    // settles. The exercises array is only mutated once, on release.
-    /// Index of the lifted card; nil when no reorder is in flight.
-    @State private var dragLiftedIndex: Int? = nil
-    /// Finger travel since the lift, applied raw to the lifted card so
-    /// it tracks the finger with zero animation lag.
-    @State private var dragTranslation: CGFloat = 0
+    // Hold a card 1s → it lifts (haptic + slight zoom); drag vertically
+    // → the OTHER cards spring out of the way live; release →
+    // everything settles. The exercises array is only mutated once, on
+    // release.
+    /// Which card is lifted + how far the finger has travelled. Lives
+    /// in @GestureState — NOT @State — deliberately: iOS resets a
+    /// GestureState unconditionally when the gesture ends OR IS
+    /// CANCELLED. A cancelled drag (scroll view stealing the touch,
+    /// system gesture, etc.) used to skip onEnded and strand the UI
+    /// with frozen make-room gaps and scrolling locked; now the worst
+    /// case is the card springing back home.
+    @GestureState(resetTransaction: Transaction(
+        animation: .spring(response: 0.35, dampingFraction: 0.8)))
+    private var exDrag: ExerciseDragState = .inactive
     /// Slot the lifted card would land in if released now — drives the
     /// make-room offsets of every other card.
     @State private var dragProposedIndex: Int? = nil
@@ -107,11 +113,12 @@ struct TrainView: View {
                 // the digit is correct the instant the app reappears,
                 // not after the next 0.5s tick.
                 recomputeTimerRemaining()
-            } else if dragLiftedIndex != nil {
-                // Backgrounded mid-drag: iOS cancels the gesture without
-                // calling onEnded, which would strand a lifted card and
-                // a locked scroll view. Settle it where it hovers.
-                commitReorder()
+            } else if dragProposedIndex != nil {
+                // Backgrounded mid-drag: the gesture cancels and
+                // @GestureState auto-resets the lift; just drop the
+                // stale proposed slot so the next drag starts clean.
+                dragProposedIndex = nil
+                frameStore.sessionActive = false
             }
         }
         .onChange(of: app.liveActivityCompletions) { _ in
@@ -166,14 +173,14 @@ struct TrainView: View {
     }
 
     /// Wipe every @State variable that's scoped to the current workout.
+    /// (`exDrag` is @GestureState — the system owns resetting it.)
     private func resetSessionState() {
         completedSets      = [:]
         editedWeights      = [:]
         expandedKey        = nil
-        dragLiftedIndex    = nil
         dragProposedIndex  = nil
-        dragTranslation    = 0
         liftedFrames       = [:]
+        frameStore.sessionActive = false
         activeTimerKey     = nil
         restTimerChoice    = [:]
         timerRemaining     = 0
@@ -238,18 +245,19 @@ struct TrainView: View {
                     .padding(.bottom, 14)
 
                 // ── Exercise cards ───────────────────────────────
-                // Hold anywhere on a card (~0.5s) and drag up/down to
+                // Hold anywhere on a card for 1s and drag up/down to
                 // reorder today's exercises, home-screen style: the
                 // card lifts with a soft haptic, the others slide out
                 // of the way while you hover, and everything springs
-                // into place on release. Reordering before starting
-                // the Live Activity means the Lock Screen card opens
-                // on the exercise the user actually does first.
-                // Disabled while a Live Activity runs — its staged
-                // snapshot advances in start order.
+                // into place on release. The 1s threshold keeps every
+                // ordinary scroll touch from arming the drag.
+                // Reordering before starting the Live Activity means
+                // the Lock Screen card opens on the exercise the user
+                // actually does first. Disabled while a Live Activity
+                // runs — its staged snapshot advances in start order.
                 VStack(spacing: Self.cardSpacing) {
                     ForEach(Array(exercises.enumerated()), id: \.offset) { idx, ex in
-                        let lifted = dragLiftedIndex == idx
+                        let lifted = exDrag.liftedIndex == idx
                         exerciseCard(ex: ex, exIdx: idx)
                             .background(
                                 GeometryReader { geo in
@@ -259,7 +267,7 @@ struct TrainView: View {
                                     )
                                 }
                             )
-                            .offset(y: lifted ? dragTranslation
+                            .offset(y: lifted ? exDrag.translation
                                               : makeRoomOffset(for: idx))
                             .scaleEffect(lifted ? 1.04 : 1)
                             // Zero-radius clear shadow when idle — a
@@ -290,7 +298,7 @@ struct TrainView: View {
         // While a card is lifted the vertical drag belongs to the
         // reorder, not the scroll — exactly like the home screen, which
         // also doesn't scroll while you're holding an icon still.
-        .scrollDisabled(dragLiftedIndex != nil)
+        .scrollDisabled(exDrag != .inactive)
         .coordinateSpace(name: Self.listSpace)
     }
 
@@ -799,50 +807,72 @@ struct TrainView: View {
     private static let listSpace = "exerciseList"
 
     /// Hold-then-drag anywhere on the card, like rearranging icons on
-    /// the iOS home screen. The long press lifts the card (haptic +
-    /// zoom); the drag that follows moves it; releasing commits the
-    /// reorder. 0.5s hold (home-screen timing) so a finger resting
-    /// mid-scroll doesn't lift a card by accident.
+    /// the iOS home screen. A full 1s hold lifts the card (haptic +
+    /// zoom) — long enough that ordinary scroll touches never arm the
+    /// drag; the drag that follows moves it; releasing commits the
+    /// reorder.
+    ///
+    /// Split across the two callback kinds on purpose:
+    ///   • `.updating($exDrag)` carries WHO is lifted and HOW FAR —
+    ///     the system resets it even when the gesture is cancelled,
+    ///     which is the fix for the stuck-cards / locked-scroll bug.
+    ///   • `.onChanged` carries the side effects (haptics, frame
+    ///     snapshot, proposed-slot updates) that don't belong inside
+    ///     the pure `updating` closure.
     private func reorderGesture(idx: Int) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.5)
+        LongPressGesture(minimumDuration: 1.0)
             .sequenced(before: DragGesture(minimumDistance: 0))
+            .updating($exDrag) { value, state, _ in
+                switch value {
+                case .first(true):
+                    state = .lifted(index: idx, translation: 0)
+                case .second(true, let drag):
+                    state = .lifted(index: idx,
+                                    translation: drag?.translation.height ?? 0)
+                default:
+                    break
+                }
+            }
             .onChanged { value in
                 switch value {
                 case .first(true):
-                    // Hold recognised — lift the card before any travel.
-                    liftCard(idx)
+                    // Hold recognised — lift before any travel. Always
+                    // runs fresh here, overwriting anything a cancelled
+                    // earlier drag left behind.
+                    onLift(idx)
                 case .second(true, let drag):
-                    if dragLiftedIndex == nil { liftCard(idx) }
-                    dragTranslation = drag?.translation.height ?? 0
-                    updateProposedIndex()
+                    if !frameStore.sessionActive { onLift(idx) }
+                    updateProposedIndex(
+                        translation: drag?.translation.height ?? 0,
+                        from: idx
+                    )
                 default:
                     break
                 }
             }
             .onEnded { _ in
-                commitReorder()
+                commitReorder(from: idx)
             }
     }
 
-    private func liftCard(_ idx: Int) {
-        guard dragLiftedIndex == nil else { return }
+    /// Lift side effects: soft haptic + freeze the base geometry the
+    /// whole drag will be measured against.
+    private func onLift(_ idx: Int) {
         // Small, soft tap — the "picked it up" cue.
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        liftedFrames      = frameStore.frames   // freeze base geometry
-        dragLiftedIndex   = idx
-        dragProposedIndex = idx
-        dragTranslation   = 0
+        liftedFrames             = frameStore.frames
+        dragProposedIndex        = idx
+        frameStore.sessionActive = true
     }
 
     /// Recompute which slot the lifted card is hovering over, using the
     /// frozen lift-time frames. Animating only this state change is what
     /// makes the OTHER cards spring aside while the lifted card itself
     /// keeps tracking the finger raw.
-    private func updateProposedIndex() {
-        guard let from = dragLiftedIndex,
-              let dragged = liftedFrames[from] else { return }
+    private func updateProposedIndex(translation: CGFloat, from: Int) {
+        guard let dragged = liftedFrames[from] else { return }
         let count = liftedFrames.count
-        let centerY = dragged.midY + dragTranslation
+        let centerY = dragged.midY + translation
 
         var proposed = from
         if let top = liftedFrames.values.map(\.minY).min(), centerY < top {
@@ -871,7 +901,7 @@ struct TrainView: View {
     /// slot move by one lifted-card height (+ spacing); everything else
     /// stays put.
     private func makeRoomOffset(for idx: Int) -> CGFloat {
-        guard let from = dragLiftedIndex,
+        guard let from = exDrag.liftedIndex,
               let to = dragProposedIndex,
               idx != from,
               let dragged = liftedFrames[from] else { return 0 }
@@ -882,20 +912,22 @@ struct TrainView: View {
     }
 
     /// Release: mutate the exercises array once (with the index-key
-    /// remap) and clear the drag state inside the same animation so the
-    /// lifted card glides into its slot as the offsets unwind.
-    private func commitReorder() {
-        let from = dragLiftedIndex
-        let to   = dragProposedIndex
+    /// remap) and clear the proposed slot inside the same animation so
+    /// the lifted card glides into place as the system resets the
+    /// gesture state (its reset transaction uses the same spring).
+    /// `from` comes from the gesture's own card — the array is never
+    /// mutated mid-drag, so the lifted card's index can't shift under
+    /// the gesture.
+    private func commitReorder(from: Int) {
+        let to = dragProposedIndex
+        frameStore.sessionActive = false
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-            if let f = from, let t = to, f != t {
-                performExerciseMove(from: f, to: t)
+            if let t = to, t != from {
+                performExerciseMove(from: from, to: t)
             }
-            dragLiftedIndex   = nil
             dragProposedIndex = nil
-            dragTranslation   = 0
         }
-        if let f = from, let t = to, f != t {
+        if let t = to, t != from {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
     }
@@ -1232,13 +1264,36 @@ private struct CardFramePreference: PreferenceKey {
     }
 }
 
+/// The reorder gesture's lifecycle value, carried in @GestureState so
+/// the system resets it on end AND on cancellation — making a stranded
+/// "stuck mid-drag" UI state impossible by construction.
+private enum ExerciseDragState: Equatable {
+    case inactive
+    case lifted(index: Int, translation: CGFloat)
+
+    var liftedIndex: Int? {
+        if case .lifted(let index, _) = self { return index }
+        return nil
+    }
+    var translation: CGFloat {
+        if case .lifted(_, let translation) = self { return translation }
+        return 0
+    }
+}
+
 /// Sink for the live card frames. A reference type on purpose: the
 /// frames are viewport-relative, so they change on EVERY scrolled
 /// frame — funnelling that through @State re-rendered the entire tab
 /// at scroll framerate and made scrolling visibly laggy. Writes here
-/// invalidate nothing; `liftCard` reads `.frames` exactly once.
+/// invalidate nothing; `onLift` reads `.frames` exactly once.
 private final class CardFrameStore {
     var frames: [Int: CGRect] = [:]
+    /// True between lift side-effects and commit — lets the drag's
+    /// `.second` events know whether the lift haptic/snapshot already
+    /// ran this gesture. A stale `true` from a cancelled drag is
+    /// harmless: the next gesture's `.first(true)` always re-lifts
+    /// fresh and overwrites the snapshot.
+    var sessionActive = false
 }
 
 // MARK: - Session Complete sheet
