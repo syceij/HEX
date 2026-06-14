@@ -1981,19 +1981,16 @@ final class AppState: ObservableObject {
         currentSession = session
     }
 
-    /// Move an exercise within the staged session (drag-to-reorder in
-    /// TrainView). In-memory only — like every other staged-session
-    /// mutation, nothing persists until the user finishes the workout.
-    /// TrainView remaps its index-keyed UI state (completedSets etc.)
-    /// before calling this so ticked sets follow their exercise.
-    func moveCurrentSessionExercise(from: Int, to: Int) {
-        guard from != to,
-              var session = currentSession,
-              var data = session.data,
-              data.exercises.indices.contains(from),
-              data.exercises.indices.contains(to) else { return }
-        let moved = data.exercises.remove(at: from)
-        data.exercises.insert(moved, at: to)
+    /// Reorder exercises within the staged session (native-List
+    /// drag-to-reorder in TrainView). In-memory only — like every other
+    /// staged-session mutation, nothing persists until the user finishes
+    /// the workout. TrainView remaps its index-keyed UI state
+    /// (completedSets etc.) before calling this so ticked sets follow
+    /// their exercise. Takes the same (IndexSet, Int) shape SwiftUI's
+    /// `.onMove` provides.
+    func moveCurrentSessionExercises(fromOffsets source: IndexSet, toOffset destination: Int) {
+        guard var session = currentSession, var data = session.data else { return }
+        data.exercises.move(fromOffsets: source, toOffset: destination)
         session.data = data
         currentSession = session
     }
