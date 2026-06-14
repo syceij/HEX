@@ -245,16 +245,16 @@ struct TrainView: View {
                     .padding(.bottom, 14)
 
                 // ── Exercise cards ───────────────────────────────
-                // Hold anywhere on a card for 1s and drag up/down to
+                // Hold the exercise NAME for 1s and drag up/down to
                 // reorder today's exercises, home-screen style: the
                 // card lifts with a soft haptic, the others slide out
                 // of the way while you hover, and everything springs
-                // into place on release. The 1s threshold keeps every
-                // ordinary scroll touch from arming the drag.
-                // Reordering before starting the Live Activity means
-                // the Lock Screen card opens on the exercise the user
-                // actually does first. Disabled while a Live Activity
-                // runs — its staged snapshot advances in start order.
+                // into place on release. The reorder gesture lives only
+                // on the name text (see exerciseCard) so the entire
+                // rest of the card — and all empty space — stays pure,
+                // never-blocked scrolling. Reordering before starting
+                // the Live Activity means the Lock Screen card opens on
+                // the exercise the user actually does first.
                 VStack(spacing: Self.cardSpacing) {
                     ForEach(Array(exercises.enumerated()), id: \.offset) { idx, ex in
                         let lifted = exDrag.liftedIndex == idx
@@ -275,10 +275,6 @@ struct TrainView: View {
                             .shadow(color: lifted ? .black.opacity(0.45) : .clear,
                                     radius: lifted ? 16 : 0, x: 0, y: lifted ? 8 : 0)
                             .zIndex(lifted ? 10 : 0)
-                            .gesture(
-                                reorderGesture(idx: idx),
-                                including: liveActivityActive ? .subviews : .all
-                            )
                     }
                 }
                 .onPreferenceChange(CardFramePreference.self) { [store = frameStore] in
@@ -480,6 +476,22 @@ struct TrainView: View {
                     Text(ex.name)
                         .font(.system(size: 15, weight: .heavy))
                         .foregroundColor(HexTheme.text)
+                        // The exercise name is the reorder handle: hold
+                        // it 1s to lift the card, then drag. Confining
+                        // the gesture here (not the whole card) leaves
+                        // every other part of the card as pure scroll.
+                        // `.contentShape` makes the full text frame —
+                        // not just the glyphs — grabbable; `simultaneous`
+                        // means a touch landing on the name still scrolls
+                        // freely, and only a deliberate 1s still-hold
+                        // arms the drag. `.subviews` mask disables it
+                        // while a Live Activity runs (snapshot is fixed
+                        // at LA start).
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(
+                            reorderGesture(idx: exIdx),
+                            including: liveActivityActive ? .subviews : .all
+                        )
                     metaLine(ex: ex)
                     if let notes = ex.notes, !notes.isEmpty {
                         Text(notes)
