@@ -148,17 +148,17 @@ jobs:
             --verbose 2>&1 | tee upload_output.log
           UPLOAD_EXIT=${PIPESTATUS[0]}
 
-          if grep -qE "Failed to upload|ERROR:.*upload|bundle version must be higher" upload_output.log; then
-            echo "------- altool reported a failure — full log below -------"
+          # altool can print a fatal error yet still exit 0 (e.g. the 403
+          # "A required agreement is missing or has expired" — which once
+          # masqueraded as a green build because the old narrow pattern
+          # didn't match it). Treat ANY altool "ERROR:" line, or a handful
+          # of explicit failure phrases, as a hard failure — regardless of
+          # exit code. altool's clean-upload output contains no "ERROR:".
+          if [ $UPLOAD_EXIT -ne 0 ] || grep -qiE "ERROR:|a required agreement|Failed to (upload|determine|process|publish)|bundle version must be higher|not been uploaded|delivery failed" upload_output.log; then
+            echo "------- TestFlight upload FAILED — full altool log below -------"
             cat upload_output.log
-            echo "ERROR: TestFlight upload failed (altool exited $UPLOAD_EXIT but output contains failure message)"
+            echo "ERROR: TestFlight upload failed (altool exit=$UPLOAD_EXIT). See log above."
             exit 1
-          fi
-
-          if [ $UPLOAD_EXIT -ne 0 ]; then
-            echo "------- Upload failed — full log below -------"
-            cat upload_output.log
-            exit $UPLOAD_EXIT
           fi
 
           echo "Successfully uploaded to TestFlight!"
